@@ -11,6 +11,8 @@ from pathlib import Path
 import requests
 from prometheus_client import start_http_server, Gauge, Counter, Info
 from dotenv import load_dotenv
+import sentry_sdk
+from sentry_sdk.integrations.logging import LoggingIntegration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +21,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# Initialize Sentry if DSN is provided
+SENTRY_DSN = os.getenv('SENTRY_DSN')
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.getenv('SENTRY_ENVIRONMENT', 'production'),
+        traces_sample_rate=float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0.1')),
+        profiles_sample_rate=float(os.getenv('SENTRY_PROFILES_SAMPLE_RATE', '0.1')),
+        integrations=[
+            LoggingIntegration(
+                level=logging.INFO,
+                event_level=logging.ERROR
+            ),
+        ],
+    )
+    logger.info("Sentry monitoring enabled")
+else:
+    logger.info("Sentry monitoring disabled (no SENTRY_DSN provided)")
 
 SHOTGUN_API_KEY = os.getenv('SHOTGUN_API_KEY')
 SHOTGUN_ORGANIZER_ID = os.getenv('SHOTGUN_ORGANIZER_ID')
@@ -712,11 +733,33 @@ class ShotgunExporter:
         start_time = time.time()
 
         try:
+            # Events fetch monitoring
             should_fetch_events = self._should_fetch_events()
             if should_fetch_events:
-                events = self.fetch_events()
-                self.update_event_metrics(events)
-                self._mark_events_fetched()
+                if SENTRY_DSN:
+                    monitor_slug = 'shotgun-events-fetch'
+                    check_in_id = sentry_sdk.crons.capture_checkin(
+                        monitor_slug=monitor_slug,
+                        status=sentry_sdk.crons.MonitorStatus.IN_PROGRESS,
+                    )
+                try:
+                    events = self.fetch_events()
+                    self.update_event_metrics(events)
+                    self._mark_events_fetched()
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.OK,
+                        )
+                except Exception as e:
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.ERROR,
+                        )
+                    raise
             else:
                 logger.info(f"Skipping events fetch (next fetch in {EVENTS_FETCH_INTERVAL/3600:.1f} hours)")
 
@@ -725,15 +768,57 @@ class ShotgunExporter:
 
             # Priority: full scan > recent scan > incremental
             if do_full_scan:
-                all_tickets = self.fetch_all_tickets(full_scan=True)
-                self.process_new_tickets(all_tickets)
-                self._mark_full_scan_done()
-                logger.info(f"Full scan completed, next full scan in {FULL_SCAN_INTERVAL/3600:.1f} hours")
+                if SENTRY_DSN:
+                    monitor_slug = 'shotgun-full-scan'
+                    check_in_id = sentry_sdk.crons.capture_checkin(
+                        monitor_slug=monitor_slug,
+                        status=sentry_sdk.crons.MonitorStatus.IN_PROGRESS,
+                    )
+                try:
+                    all_tickets = self.fetch_all_tickets(full_scan=True)
+                    self.process_new_tickets(all_tickets)
+                    self._mark_full_scan_done()
+                    logger.info(f"Full scan completed, next full scan in {FULL_SCAN_INTERVAL/3600:.1f} hours")
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.OK,
+                        )
+                except Exception as e:
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.ERROR,
+                        )
+                    raise
             elif do_recent_scan:
-                recent_tickets = self.fetch_all_tickets(recent_only=True)
-                self.process_new_tickets(recent_tickets)
-                self._mark_recent_scan_done()
-                logger.info(f"Recent scan completed, next recent scan in {RECENT_SCAN_INTERVAL/3600:.1f} hours")
+                if SENTRY_DSN:
+                    monitor_slug = 'shotgun-recent-scan'
+                    check_in_id = sentry_sdk.crons.capture_checkin(
+                        monitor_slug=monitor_slug,
+                        status=sentry_sdk.crons.MonitorStatus.IN_PROGRESS,
+                    )
+                try:
+                    recent_tickets = self.fetch_all_tickets(recent_only=True)
+                    self.process_new_tickets(recent_tickets)
+                    self._mark_recent_scan_done()
+                    logger.info(f"Recent scan completed, next recent scan in {RECENT_SCAN_INTERVAL/3600:.1f} hours")
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.OK,
+                        )
+                except Exception as e:
+                    if SENTRY_DSN:
+                        sentry_sdk.crons.capture_checkin(
+                            check_in_id=check_in_id,
+                            monitor_slug=monitor_slug,
+                            status=sentry_sdk.crons.MonitorStatus.ERROR,
+                        )
+                    raise
             else:
                 all_tickets = self.fetch_all_tickets(full_scan=False)
                 self.process_new_tickets(all_tickets)
