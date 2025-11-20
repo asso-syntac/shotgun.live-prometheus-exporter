@@ -397,17 +397,19 @@ class ShotgunExporter:
                 if recent_only:
                     old_tickets_in_page = 0
                     for ticket in tickets:
-                        created_at_str = ticket.get('ticket_created_at')
-                        if created_at_str:
+                        # Use 'ordered_at' which is the purchase date
+                        ordered_at_str = ticket.get('ordered_at')
+                        if ordered_at_str:
                             try:
-                                created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
-                                if created_at.replace(tzinfo=None) < cutoff_time:
+                                ordered_at = datetime.fromisoformat(ordered_at_str.replace('Z', '+00:00'))
+                                if ordered_at.replace(tzinfo=None) < cutoff_time:
                                     old_tickets_in_page += 1
-                            except:
+                            except Exception as e:
+                                logger.debug(f"Could not parse date '{ordered_at_str}': {e}")
                                 pass
 
                     if old_tickets_in_page >= len(tickets) * 0.8:  # If 80% of page is >24h old
-                        logger.info(f"Recent scan: most tickets in page older than 24h, stopping pagination")
+                        logger.info(f"Recent scan: {old_tickets_in_page}/{len(tickets)} tickets older than 24h, stopping pagination")
                         conn.close()
                         logger.info(f"Total: {len(all_tickets)} tickets fetched in {page_count} page(s)")
                         return all_tickets
