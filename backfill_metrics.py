@@ -371,9 +371,9 @@ class BackfillExporter:
         return results
 
     # Interval (ms) between fill-forward points to keep series continuous.
-    # Must match or be smaller than the scrape interval (5m) so that
-    # range queries at any step never see a gap.
-    FILL_INTERVAL_MS = 5 * 60 * 1000
+    # 1 hour keeps volume reasonable. VictoriaMetrics' maxStalenessInterval
+    # (set to 2h) handles any sub-hour gaps in range queries.
+    FILL_INTERVAL_MS = 60 * 60 * 1000
 
     def build_cumulative_lines(self, tickets: List[Dict], event_name: str) -> List[str]:
         """Build cumulative Prometheus lines for a list of tickets (single event).

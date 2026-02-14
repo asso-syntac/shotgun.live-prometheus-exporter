@@ -1,29 +1,17 @@
 # Shotgun Exporter
 
-Petit exporter Prometheus pour récupérer les chiffres d’une billetterie Shotgun (https://shotgun.live) et les afficher dans Grafana. Idéal pour suivre les ventes, les scans à l’entrée et les remboursements sans se prendre la tête.
+Exporteur Prometheus pour [Shotgun.live](https://shotgun.live) : suit les ventes de billets, scans d'entree et remboursements, et expose les metriques pour VictoriaMetrics + Grafana.
 
-Compte tenu des contraintes de l’API Shotgun, l’exporteur conserve un état persistant. Autant en profiter pour garder quelques informations non sensibles sur les billets, ça pourrait être utile pour la suite. Aucune donnée personnelle n’est stockée : uniquement des données ne permettant pas d’identifier l’acheteur.
+## Demarrage rapide
 
-## Pourquoi
-
-- Suivre ça dans l’interface web Shotgun devient vite compliqué sur de gros événements (peu d’agrégations/historique, difficile à consolider).
-- Ici, on pousse les données dans une TSDB, le requêtage est donc beaucoup plus simple et léger.
-- On peut y faire converger d’autres revendeurs ou d’autres métriques au même endroit pour une vue unifiée.
-
-## Stack de démo
-
-- Python exporter (HTTP `/metrics`)
-- vmagent → VictoriaMetrics (stockage TSDB)
-- Grafana (dashboards)
-- SQLite (cache local, historique tickets)
-
-## Démarrage rapide
-
-**Prérequis:** Docker + Docker Compose, un token API Shotgun _(un JWT à récupérer dans Settings > Integrations > Shotgun APIs)_ et votre Organizer ID.
+**Prerequis :** Docker + Docker Compose, un token API Shotgun _(JWT a recuperer dans Settings > Integrations > Shotgun APIs)_ et votre Organizer ID.
 
 ```bash
+git clone https://github.com/asso-syntac/shotgun.live-prometheus-exporter.git
+cd shotgun.live-prometheus-exporter
+
 cp .env.example .env
-# Éditer .env avec vos credentials :
+# Editer .env avec vos credentials :
 #   SHOTGUN_TOKEN=votre-jwt
 #   SHOTGUN_ORGANIZER_ID=votre-id
 
@@ -31,99 +19,177 @@ mkdir -p data/{victoria-metrics,grafana}
 docker compose up -d
 ```
 
-- Exporter: http://localhost:9090/metrics
-- API: http://localhost:9091 (voir section API ci-dessous)
-- Grafana: http://localhost:3000 (admin/admin)
-- VictoriaMetrics: http://localhost:8428
+Verifier que tout tourne :
+
+```bash
+docker compose ps
+```
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| Exporter | http://localhost:9090/metrics | Metriques Prometheus |
+| API | http://localhost:9091/health | API de declenchement |
+| Grafana | http://localhost:3000 | Dashboards (admin/admin) |
+| VictoriaMetrics | http://localhost:8428 | TSDB |
+
+> Tous les ports sont bindes sur `127.0.0.1` uniquement.
 
 ## Image Docker
 
-Une image pré-construite est disponible :
+L'image est publiee automatiquement par la CI :
 
-```bash
-docker pull ghcr.io/zalexshow/shotgun.live-prometheus-exporter:main
+```
+ghcr.io/asso-syntac/shotgun.live-prometheus-exporter:main
 ```
 
-Vous pouvez remplacer `build: .` par
-`image: ghcr.io/zalexshow/shotgun.live-prometheus-exporter:main` dans le
-service `shotgun-exporter` si vous ne souhaitez pas construire l'image en local.
+Le `docker-compose.yml` l'utilise par defaut. Pour builder localement (dev) :
 
-## Métriques
-
-- `shotgun_tickets_sold_total`: tickets vendus (labels: event, ticket_title, channel)
-- `shotgun_tickets_revenue_euros_total`: revenus en euros
-- `shotgun_tickets_refunded_total`: tickets remboursés/annulés
-- `shotgun_tickets_scanned_total`: tickets scannés
-- `shotgun_events_total`: événements par statut (active/past/cancelled)
-
-Le reste est visible sur `/metrics` une fois lancé.
-
-## API de déclenchement manuel
-
-L'exporter expose une API sur le port 9091 pour déclencher manuellement les différents types de scans. Utile lorsqu'un écart est détecté entre les métriques et la réalité.
-
-**Déclencher un scan complet (tous les billets) :**
 ```bash
+docker compose build shotgun-exporter
+# ou avec un override :
+# docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+```
+
+## Backfill des donnees historiques
+
+Le backfill recupere l'historique complet des billets depuis l'API Shotgun et injecte les metriques dans VictoriaMetrics avec les timestamps d'origine. Cela permet d'avoir des courbes continues dans Grafana des la mise en place.
+
+### Comment ca marche
+
+- Traite les evenements un par un (faible conso memoire)
+- Calcule des **compteurs cumulatifs** (valeur = total courant a chaque instant)
+- Remplit les trous entre les points reels (fill-forward toutes les heures) pour eviter les gaps dans Grafana
+- Respecte le rate limit de l'API Shotgun (200 appels/min) avec retry automatique sur 429 et 5xx
+- Progression sauvegardee en SQLite : reprise possible apres interruption
+
+### Lancer le backfill
+
+```bash
+# Backfill complet (tous les evenements)
+docker compose run --rm backfill
+
+# Dry run (aucune donnee ecrite, utile pour verifier)
+docker compose run --rm backfill python backfill_metrics.py --dry-run
+
+# Reprendre apres interruption (saute les evenements deja traites)
+docker compose run --rm backfill python backfill_metrics.py --resume
+```
+
+### Re-executer le backfill
+
+Si vous devez relancer un backfill complet (par ex. apres avoir purge VictoriaMetrics), lancez simplement sans `--resume` : tous les evenements seront retraites.
+
+Pour purger VictoriaMetrics avant de re-backfiller :
+
+```bash
+docker compose stop victoriametrics
+rm -rf data/victoria-metrics/*
+docker compose start victoriametrics
+# Attendre quelques secondes que VM demarre
+docker compose run --rm backfill
+```
+
+### Volume de donnees
+
+A titre indicatif, ~12 000 billets sur 54 evenements generent environ 2M de lignes de metriques (avec fill-forward a 1h). Le backfill prend quelques minutes.
+
+## Metriques exposees
+
+| Metrique | Labels | Description |
+|----------|--------|-------------|
+| `shotgun_tickets_sold_total` | event_id, event_name, ticket_title | Billets vendus |
+| `shotgun_tickets_revenue_euros_total` | event_id, event_name, ticket_title | Revenus en euros |
+| `shotgun_tickets_refunded_total` | event_id, event_name, ticket_title | Billets rembourses/annules |
+| `shotgun_tickets_scanned_total` | event_id, event_name | Billets scannes a l'entree |
+| `shotgun_tickets_by_channel_total` | event_id, event_name, channel | Ventes par canal |
+| `shotgun_tickets_by_payment_method_total` | event_id, event_name, payment_method | Ventes par moyen de paiement |
+| `shotgun_tickets_by_utm_source_total` | event_id, event_name, utm_source | Ventes par source UTM |
+| `shotgun_tickets_by_utm_medium_total` | event_id, event_name, utm_medium | Ventes par medium UTM |
+| `shotgun_tickets_by_visibility_total` | event_id, event_name, visibility | Ventes par visibilite |
+| `shotgun_tickets_fees_euros_total` | event_id, event_name, fee_type | Frais en euros |
+| `shotgun_events_total` | status | Nombre d'evenements par statut |
+| `shotgun_event_tickets_left` | event_id, event_name | Places restantes par evenement |
+
+## API de declenchement manuel
+
+L'exporter expose une API sur le port 9091 :
+
+```bash
+# Scan complet (tous les billets)
 curl -X POST http://localhost:9091/trigger/full-scan
-```
 
-**Déclencher un scan incrémental (depuis le dernier billet connu) :**
-```bash
+# Scan incremental (depuis le dernier billet connu)
 curl -X POST http://localhost:9091/trigger/incremental
-```
 
-**Déclencher une mise à jour des événements :**
-```bash
+# Mise a jour des evenements
 curl -X POST http://localhost:9091/trigger/events
-```
 
-**Vérifier l'état de l'API :**
-```bash
+# Health check
 curl http://localhost:9091/health
 ```
 
-Toutes les requêtes retournent immédiatement et le scan s'exécute en arrière-plan. Les logs montrent la progression en temps réel.
+## Configuration
 
-## Ré-importation avec timestamps historiques
+Toutes les variables sont dans `.env` (voir `.env.example`) :
 
-Par défaut, les métriques sont enregistrées avec le timestamp du scrape. Si vous voulez réimporter des données avec leurs timestamps d'origine (date d'achat, date de scan, etc.), utilisez le script `reimport_event.py`.
+| Variable | Defaut | Description |
+|----------|--------|-------------|
+| `SHOTGUN_TOKEN` | _(obligatoire)_ | JWT API Shotgun |
+| `SHOTGUN_ORGANIZER_ID` | _(obligatoire)_ | ID de l'organisateur |
+| `SCRAPE_INTERVAL` | `300` | Intervalle de scrape en secondes |
+| `EVENTS_FETCH_INTERVAL` | `3600` | Intervalle de refresh des evenements |
+| `FULL_SCAN_INTERVAL` | `86400` | Intervalle du scan complet |
+| `INCLUDE_COHOSTED_EVENTS` | `false` | Inclure les evenements co-organises |
+| `SENTRY_DSN` | _(vide)_ | DSN Sentry (optionnel) |
+| `GF_USER_ID` | `1000` | UID pour le conteneur Grafana |
 
-**Lister les événements disponibles :**
-```bash
-docker compose exec shotgun-exporter python reimport_event.py --list
+## Donnees & persistance
+
+Tout est dans `./data/` :
+
+| Chemin | Contenu |
+|--------|---------|
+| `data/shotgun_tickets.db` | Cache SQLite (tickets, progression backfill) |
+| `data/victoria-metrics/` | Donnees time-series |
+| `data/grafana/` | Config et plugins Grafana |
+
+> Le repertoire `data/` est dans `.gitignore`. Aucune donnee personnelle n'est stockee : uniquement des donnees ne permettant pas d'identifier l'acheteur.
+
+## Architecture
+
+```
+                        +-------------------+
+                        |   Shotgun API     |
+                        +--------+----------+
+                                 |
+                    +------------+------------+
+                    |                         |
+           +-------v--------+    +-----------v-----------+
+           | shotgun-exporter|    |    backfill (one-shot) |
+           | (scrape continu)|    | (historique complet)   |
+           +-------+--------+    +-----------+-----------+
+                   |                         |
+            /metrics                   /api/v1/import
+                   |                         |
+           +-------v--------+               |
+           |    vmagent      +---------------+
+           +-------+--------+
+                   |
+           +-------v--------+
+           | VictoriaMetrics |
+           +-------+--------+
+                   |
+           +-------v--------+
+           |    Grafana      |
+           +----------------+
 ```
 
-**Tester la ré-importation (dry run) :**
-```bash
-docker compose exec shotgun-exporter python reimport_event.py --event 123456 --dry-run
-```
+- **vmagent** scrape l'exporter toutes les 5 min et envoie a VictoriaMetrics
+- **backfill** injecte directement dans VictoriaMetrics via l'API d'import
+- Les labels `job` et `instance` sont supprimes par vmagent (`victoriametrics.yml`) pour que les series backfillees et scrapees soient identiques
+- VictoriaMetrics est configure avec `--search.maxStalenessInterval=2h` pour gerer les gaps entre les points de fill-forward (espaces d'1h)
 
-**Ré-importer un événement :**
-```bash
-docker compose exec shotgun-exporter python reimport_event.py --event 123456
-```
-
-**Ré-importer tous les événements :**
-```bash
-docker compose exec shotgun-exporter python reimport_event.py --all
-```
-
-Cette opération :
-1. Supprime toutes les métriques existantes pour l'événement dans VictoriaMetrics
-2. Ré-insère les données avec les timestamps d'origine :
-   - Ventes : `ordered_at` (date d'achat)
-   - Remboursements : `ticket_canceled_at` (date d'annulation)
-   - Scans : `ticket_scanned_at` (date de scan à l'entrée)
-
-**Attention :** Cette opération supprime définitivement les données existantes. Utilisez `--dry-run` pour voir ce qui sera fait avant de l'exécuter.
-
-## Données & persistance
-
-- `./data/shotgun_tickets.db` (SQLite): historique et statut des tickets
-- `./data/victoria-metrics/`: données time‑series
-- `./data/grafana/`: dashboards/config Grafana
-
-## Dev rapide
+## Developpement
 
 ```bash
 python3 -m venv venv
@@ -132,54 +198,7 @@ pip install -r requirements.txt
 python shotgun_exporter.py
 ```
 
-## Crédits
+## Credits
 
-C'est un mini projet porté par SYNTAC (https://syntac.fr)
-Pensé pour FZL (https://www.fzlprod.com/) & Foreztival (https://foreztival.com/)
-Fonctionne avec Shotgun (https://shotgun.live/)
-
-
-## Notes
-
-Exemple de structure des données conservées dans l'état/cache local (sqlite) pour chaque billet vendu _(aucune donnée personnelle)_ :
-
-```json
-{
-  "order_id": 10000001,
-  "currency": "eur",
-  "payment_method": "card",
-  "utm_source": "example.com",
-  "utm_medium": "website",
-  "product_id": 200100,
-  "ordered_at": "2025-01-15T18:54:55.242Z",
-  "event_id": 300200,
-  "event_name": "Concert Exemple au Grand Théâtre",
-  "event_start_time": "2025-02-10T19:00:00.000Z",
-  "event_end_time": "2025-02-10T22:00:00.000Z",
-  "event_cancellation_date": null,
-  "event_on_sale_date": "2024-12-09T14:49:14.120Z",
-  "event_creation_date": "2024-12-01T12:00:00.000Z",
-  "event_publication_date": "2024-12-13T09:00:00.837Z",
-  "event_launch_date": "2024-12-13T09:00:02.020Z",
-  "buyer_zip_code": "00000",
-  "buyer_city": "Exempleville",
-  "buyer_country": "France",
-  "ticket_id": 400300,
-  "ticket_barcode": "12345678901234",
-  "ticket_redeemed_at": null,
-  "shotguner_id": 500400,
-  "cancelled_at": null,
-  "ticket_updated_at": "2025-01-15T18:54:55.242Z",
-  "ticket_visibilities": "{public,xpress_door,promoters}",
-  "ticket_price": 30,
-  "ticket_title": "Catégorie A",
-  "channel": "online",
-  "service_fee": 5,
-  "user_service_fee": 0.99,
-  "producer_cost": 0,
-  "vat_rate": 0.055,
-  "ticket_sub_category": null,
-  "ticket_status": "valid",
-  "sales_status": "OnSale"
-}
-```
+Projet porte par [SYNTAC](https://syntac.fr), pense pour [FZL](https://www.fzlprod.com/) & [Foreztival](https://foreztival.com/).
+Fonctionne avec [Shotgun](https://shotgun.live/).

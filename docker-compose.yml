@@ -1,6 +1,6 @@
 services:
   shotgun-exporter:
-    build: .
+    image: ghcr.io/asso-syntac/shotgun.live-prometheus-exporter:main
     container_name: shotgun-exporter
     restart: unless-stopped
     ports:
@@ -29,9 +29,9 @@ services:
     depends_on:
       - victoriametrics
 
-  # One-shot backfill service - run with: docker compose run --rm backfill
+  # One-shot backfill service — run with: docker compose run --rm backfill
   backfill:
-    build: .
+    image: ghcr.io/asso-syntac/shotgun.live-prometheus-exporter:main
     container_name: shotgun-backfill
     env_file:
       - .env
@@ -62,8 +62,7 @@ services:
       - '--storageDataPath=/victoria-metrics-data'
       - '--retentionPeriod=5y'
       - '--httpListenAddr=:8428'
-
-
+      - '--search.maxStalenessInterval=2h'
     networks:
       - monitoring
 
@@ -85,14 +84,14 @@ services:
     image: grafana/grafana:latest
     container_name: grafana
     restart: unless-stopped
-    user: "1000"
+    user: "${GF_USER_ID:-1000}"
     ports:
       - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - ./grafana-provisioning:/etc/grafana/provisioning
+      - ./grafana-provisioning/datasources:/etc/grafana/provisioning/datasources
       - ./data/grafana:/var/lib/grafana
     networks:
       - monitoring
