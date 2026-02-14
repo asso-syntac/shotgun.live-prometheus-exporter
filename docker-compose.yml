@@ -9,14 +9,15 @@ services:
     env_file:
       - .env
     environment:
-      - SHOTGUN_API_KEY=${SHOTGUN_API_KEY}
+      - SHOTGUN_TOKEN=${SHOTGUN_TOKEN}
       - SHOTGUN_ORGANIZER_ID=${SHOTGUN_ORGANIZER_ID}
       - EXPORTER_PORT=9090
       - API_PORT=9091
       - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-300}
-      - INCLUDE_COHOSTED_EVENTS=true
+      - INCLUDE_COHOSTED_EVENTS=${INCLUDE_COHOSTED_EVENTS:-false}
       - EVENTS_FETCH_INTERVAL=${EVENTS_FETCH_INTERVAL:-3600}
-      - RECENT_SCAN_INTERVAL=${RECENT_SCAN_INTERVAL:-3600}
+      - FULL_SCAN_INTERVAL=${FULL_SCAN_INTERVAL:-86400}
+      - VICTORIA_METRICS_URL=http://victoriametrics:8428
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
       - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
@@ -25,6 +26,29 @@ services:
       - ./data:/data
     networks:
       - monitoring
+    depends_on:
+      - victoriametrics
+
+  # One-shot backfill service - run with: docker compose run --rm backfill
+  backfill:
+    build: .
+    container_name: shotgun-backfill
+    env_file:
+      - .env
+    environment:
+      - SHOTGUN_TOKEN=${SHOTGUN_TOKEN}
+      - SHOTGUN_ORGANIZER_ID=${SHOTGUN_ORGANIZER_ID}
+      - INCLUDE_COHOSTED_EVENTS=${INCLUDE_COHOSTED_EVENTS:-false}
+      - VICTORIA_METRICS_URL=http://victoriametrics:8428
+    volumes:
+      - ./data:/data
+    networks:
+      - monitoring
+    depends_on:
+      - victoriametrics
+    command: ["python", "backfill_metrics.py"]
+    profiles:
+      - tools
 
   victoriametrics:
     image: victoriametrics/victoria-metrics:latest
@@ -36,12 +60,12 @@ services:
       - ./data/victoria-metrics:/victoria-metrics-data
     command:
       - '--storageDataPath=/victoria-metrics-data'
-      - '--retentionPeriod=5y'  # Rétention de 5 ans
+      - '--retentionPeriod=5y'
       - '--httpListenAddr=:8428'
+
+
     networks:
       - monitoring
-    depends_on:
-      - shotgun-exporter
 
   vmagent:
     image: victoriametrics/vmagent:latest
@@ -61,6 +85,7 @@ services:
     image: grafana/grafana:latest
     container_name: grafana
     restart: unless-stopped
+    user: "1000"
     ports:
       - "127.0.0.1:3000:3000"
     environment:
@@ -68,6 +93,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./grafana-provisioning:/etc/grafana/provisioning
+      - ./data/grafana:/var/lib/grafana
     networks:
       - monitoring
     depends_on:

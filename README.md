@@ -19,19 +19,14 @@ Compte tenu des contraintes de l’API Shotgun, l’exporteur conserve un état 
 
 ## Démarrage rapide
 
-**Prérequis:** Docker + Docker Compose, une clé API Shotgun _(en réalité c'est un JWT)_ et votre Organizer ID (Settings > Integrations > Shotgun APIs).
-
-`.env` minimal:
-
-```env
-SHOTGUN_API_KEY=xxx
-SHOTGUN_ORGANIZER_ID=12345
-EXPORTER_PORT=9090
-SCRAPE_INTERVAL=300
-INCLUDE_COHOSTED_EVENTS=false
-```
+**Prérequis:** Docker + Docker Compose, un token API Shotgun _(un JWT à récupérer dans Settings > Integrations > Shotgun APIs)_ et votre Organizer ID.
 
 ```bash
+cp .env.example .env
+# Éditer .env avec vos credentials :
+#   SHOTGUN_TOKEN=votre-jwt
+#   SHOTGUN_ORGANIZER_ID=votre-id
+
 mkdir -p data/{victoria-metrics,grafana}
 docker compose up -d
 ```
@@ -72,12 +67,7 @@ L'exporter expose une API sur le port 9091 pour déclencher manuellement les dif
 curl -X POST http://localhost:9091/trigger/full-scan
 ```
 
-**Déclencher un scan récent (billets des dernières 24h) :**
-```bash
-curl -X POST http://localhost:9091/trigger/recent-scan
-```
-
-**Déclencher un scan incrémental (jusqu'aux billets connus) :**
+**Déclencher un scan incrémental (depuis le dernier billet connu) :**
 ```bash
 curl -X POST http://localhost:9091/trigger/incremental
 ```
@@ -122,8 +112,8 @@ Cette opération :
 1. Supprime toutes les métriques existantes pour l'événement dans VictoriaMetrics
 2. Ré-insère les données avec les timestamps d'origine :
    - Ventes : `ordered_at` (date d'achat)
-   - Remboursements : `cancelled_at` (date d'annulation)
-   - Scans : `ticket_redeemed_at` (date de scan à l'entrée)
+   - Remboursements : `ticket_canceled_at` (date d'annulation)
+   - Scans : `ticket_scanned_at` (date de scan à l'entrée)
 
 **Attention :** Cette opération supprime définitivement les données existantes. Utilisez `--dry-run` pour voir ce qui sera fait avant de l'exécuter.
 

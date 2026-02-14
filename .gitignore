@@ -26,6 +26,7 @@ ENV/
 env/
 
 # Environment variables
+.env
 .env.local
 .env.*.local
 
@@ -48,3 +49,6 @@ Thumbs.db
 
 # Données persistées localement
 data/
+
+# Doc
+*.pdf

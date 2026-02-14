@@ -8,3 +8,8 @@ scrape_configs:
       - targets: ['shotgun-exporter:9090']
     scrape_interval: 5m
     scrape_timeout: 60s
+    metric_relabel_configs:
+      - regex: instance
+        action: labeldrop
+      - regex: job
+        action: labeldrop
