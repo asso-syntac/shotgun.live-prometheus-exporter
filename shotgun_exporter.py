@@ -222,9 +222,19 @@ class ShotgunExporter:
                 CREATE TABLE IF NOT EXISTS events_cache (
                     event_id INTEGER PRIMARY KEY,
                     event_name TEXT NOT NULL,
+                    event_starts_at TEXT,
+                    cancelled_at TEXT,
                     updated_at TEXT NOT NULL
                 )
             ''')
+
+            # Additive migration for pre-existing installs
+            cursor.execute("PRAGMA table_info(events_cache)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if 'event_starts_at' not in existing_cols:
+                cursor.execute('ALTER TABLE events_cache ADD COLUMN event_starts_at TEXT')
+            if 'cancelled_at' not in existing_cols:
+                cursor.execute('ALTER TABLE events_cache ADD COLUMN cancelled_at TEXT')
 
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_event_id ON tickets(event_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON tickets(ticket_status)')
@@ -269,12 +279,19 @@ class ShotgunExporter:
         for event in events:
             event_id = event.get('id')
             event_name = event.get('name', 'Unknown Event')
+            event_starts_at = event.get('startTime')
+            cancelled_at = event.get('cancelledAt')
             if event_id:
                 self._events_cache[event_id] = event_name
                 cursor.execute('''
-                    INSERT OR REPLACE INTO events_cache (event_id, event_name, updated_at)
-                    VALUES (?, ?, ?)
-                ''', (event_id, event_name, now))
+                    INSERT INTO events_cache (event_id, event_name, event_starts_at, cancelled_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        event_name = excluded.event_name,
+                        event_starts_at = excluded.event_starts_at,
+                        cancelled_at = excluded.cancelled_at,
+                        updated_at = excluded.updated_at
+                ''', (event_id, event_name, event_starts_at, cancelled_at, now))
 
         conn.commit()
         conn.close()

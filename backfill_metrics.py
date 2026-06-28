@@ -42,7 +42,8 @@ DB_FILE = Path('/data/shotgun_tickets.db')
 
 
 class BackfillExporter:
-    def __init__(self, dry_run: bool = False, batch_size: int = 1000, resume: bool = False):
+    def __init__(self, dry_run: bool = False, batch_size: int = 1000, resume: bool = False,
+                 fill_interval: int = 300, until: Optional[str] = None):
         if not SHOTGUN_TOKEN:
             raise ValueError("SHOTGUN_TOKEN must be defined in .env file")
         if not SHOTGUN_ORGANIZER_ID:
@@ -55,6 +56,16 @@ class BackfillExporter:
         self.batch_size = batch_size
         self.resume = resume
         self.events_cache: Dict[int, str] = {}
+
+        # Fill-forward grid: emit a point every `fill_interval` seconds so the
+        # backfilled series have the same density as the live scrape and render
+        # as a continuous block instead of a sparse "comb".
+        self.fill_interval_ms = max(1, fill_interval) * 1000
+        # Carry each series' final value forward up to this point. Defaults to
+        # the run time ("now") so backfilled data overlaps the live scrape and
+        # leaves no gap at the handoff. Override with --until for reproducibility.
+        until_ms = self._get_timestamp_ms(until) if until else None
+        self.fill_until_ms = until_ms or int(time.time() * 1000)
 
         # Init database
         DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -370,19 +381,15 @@ class BackfillExporter:
 
         return results
 
-    # Interval (ms) between fill-forward points to keep series continuous.
-    # 1 hour keeps volume reasonable. VictoriaMetrics' maxStalenessInterval
-    # (set to 2h) handles any sub-hour gaps in range queries.
-    FILL_INTERVAL_MS = 60 * 60 * 1000
-
     def build_cumulative_lines(self, tickets: List[Dict], event_name: str) -> List[str]:
         """Build cumulative Prometheus lines for a list of tickets (single event).
 
-        After computing cumulative values, emits fill-forward points at regular
-        intervals between real data points AND after the last point of each
-        series up to the event's last activity timestamp. This ensures all
-        series for a given event span the same time range (e.g. "Tarif Early"
-        that ended early still shows its final value until the event is over).
+        After computing cumulative values, emits fill-forward points on an
+        epoch-aligned grid (every self.fill_interval_ms) between real data points
+        AND after the last point of each series, up to self.fill_until_ms ("now"
+        by default). Aligning to a shared grid keeps stacked panels clean, and
+        carrying the final value forward to the handoff point means backfilled
+        series overlap the live scrape with no gap (no "comb", no boundary hole).
         """
         # Collect all metric events
         raw_events = []
@@ -394,10 +401,6 @@ class BackfillExporter:
 
         # Sort by timestamp
         raw_events.sort(key=lambda e: e[3])
-
-        # Find the latest timestamp across ALL series of this event.
-        # This is the "event end" — all series will be filled up to this point.
-        event_end_ms = max(e[3] for e in raw_events)
 
         # Build cumulative values at each real event timestamp
         cumulative: Dict[str, float] = defaultdict(float)
@@ -418,24 +421,26 @@ class BackfillExporter:
             prev_val = None
 
             for ts_ms, val in points:
-                # Fill gap between previous point and this one
+                # Fill gap between previous point and this one, on an
+                # epoch-aligned grid so all series share the same timestamps.
                 if prev_ts is not None:
-                    fill_ts = prev_ts + self.FILL_INTERVAL_MS
+                    fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
                     while fill_ts < ts_ms:
                         lines.append(f"{metric}{{{labels_key}}} {prev_val} {fill_ts}")
-                        fill_ts += self.FILL_INTERVAL_MS
+                        fill_ts += self.fill_interval_ms
 
                 # Emit the real point
                 lines.append(f"{metric}{{{labels_key}}} {val} {ts_ms}")
                 prev_ts = ts_ms
                 prev_val = val
 
-            # Fill forward from last point of this series to event end
-            if prev_ts is not None and prev_ts < event_end_ms:
-                fill_ts = prev_ts + self.FILL_INTERVAL_MS
-                while fill_ts <= event_end_ms:
+            # Carry the final value forward up to the handoff point (now, or
+            # --until), so backfilled series overlap the live scrape with no gap.
+            if prev_ts is not None and prev_ts < self.fill_until_ms:
+                fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
+                while fill_ts <= self.fill_until_ms:
                     lines.append(f"{metric}{{{labels_key}}} {prev_val} {fill_ts}")
-                    fill_ts += self.FILL_INTERVAL_MS
+                    fill_ts += self.fill_interval_ms
 
         # Sort all lines by timestamp for ordered ingestion
         lines.sort(key=lambda l: int(l.rsplit(' ', 1)[1]))
@@ -681,6 +686,12 @@ Examples:
 
   # With custom batch size
   python backfill_metrics.py --batch-size 500
+
+  # Coarser fill grid (less data) — keep it well under maxStalenessInterval
+  python backfill_metrics.py --fill-interval 600
+
+  # Fill up to a fixed point instead of "now" (reproducible re-runs)
+  python backfill_metrics.py --until 2026-02-15T00:00:00Z
         '''
     )
 
@@ -690,6 +701,12 @@ Examples:
                         help='Skip events already completed in a previous run')
     parser.add_argument('--batch-size', type=int, default=1000,
                         help='Number of metric lines per batch (default: 1000)')
+    parser.add_argument('--fill-interval', type=int, default=300,
+                        help='Seconds between fill-forward points; match the live '
+                             'scrape interval for a seamless join (default: 300)')
+    parser.add_argument('--until', type=str, default=None,
+                        help='ISO timestamp to carry series forward to '
+                             '(default: now, so backfill overlaps the live scrape)')
 
     args = parser.parse_args()
 
@@ -697,7 +714,9 @@ Examples:
         exporter = BackfillExporter(
             dry_run=args.dry_run,
             batch_size=args.batch_size,
-            resume=args.resume
+            resume=args.resume,
+            fill_interval=args.fill_interval,
+            until=args.until
         )
         exporter.run()
     except ValueError as e:
