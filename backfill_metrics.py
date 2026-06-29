@@ -43,7 +43,7 @@ DB_FILE = Path('/data/shotgun_tickets.db')
 
 class BackfillExporter:
     def __init__(self, dry_run: bool = False, batch_size: int = 1000, resume: bool = False,
-                 fill_interval: int = 1800, until: Optional[str] = None):
+                 fill_interval: int = 1800, until: Optional[str] = None, since: Optional[str] = None):
         if not SHOTGUN_TOKEN:
             raise ValueError("SHOTGUN_TOKEN must be defined in .env file")
         if not SHOTGUN_ORGANIZER_ID:
@@ -68,6 +68,9 @@ class BackfillExporter:
         # default) so backfilled data overlaps the live scrape with no gap.
         until_ms = self._get_timestamp_ms(until) if until else None
         self.fill_until_ms = until_ms or int(time.time() * 1000)
+        # Lower bound: only emit points >= this. 0 = whole history; set --from to
+        # patch just a window (e.g. a scrape gap) without re-pushing everything.
+        self.fill_from_ms = (self._get_timestamp_ms(since) if since else None) or 0
 
         # Init database
         DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -390,6 +393,10 @@ class BackfillExporter:
         self.fill_interval_ms) between real data points and up to
         self.fill_until_ms. The shared grid keeps stacked sum() panels clean.
 
+        Only points whose timestamp falls in [self.fill_from_ms, self.fill_until_ms]
+        are emitted (cumulative values are still computed over ALL tickets), so a
+        narrow --from/--until window patches just that period — e.g. a scrape gap.
+
         Lines are yielded lazily (not materialised) so memory stays bounded even
         for high-cardinality events spanning months — VictoriaMetrics accepts
         unordered samples, so no global sort is needed.
@@ -410,6 +417,10 @@ class BackfillExporter:
             cumulative[key] += increment
             series_points[key].append((ts_ms, cumulative[key]))
 
+        lo, hi, step = self.fill_from_ms, self.fill_until_ms, self.fill_interval_ms
+        # First aligned grid tick >= lo, to skip fill below the window cheaply.
+        lo_tick = ((lo + step - 1) // step) * step
+
         for key, points in series_points.items():
             metric, labels_key = key.split('|', 1)
             prev_ts = None
@@ -417,20 +428,25 @@ class BackfillExporter:
 
             for ts_ms, val in points:
                 if prev_ts is not None:
-                    fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
-                    while fill_ts < ts_ms:
+                    fill_ts = (prev_ts // step + 1) * step
+                    if fill_ts < lo_tick:
+                        fill_ts = lo_tick
+                    while fill_ts < ts_ms and fill_ts <= hi:
                         yield f"{metric}{{{labels_key}}} {prev_val} {fill_ts}"
-                        fill_ts += self.fill_interval_ms
+                        fill_ts += step
 
-                yield f"{metric}{{{labels_key}}} {val} {ts_ms}"
+                if lo <= ts_ms <= hi:
+                    yield f"{metric}{{{labels_key}}} {val} {ts_ms}"
                 prev_ts = ts_ms
                 prev_val = val
 
-            if prev_ts is not None and prev_ts < self.fill_until_ms:
-                fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
-                while fill_ts <= self.fill_until_ms:
+            if prev_ts is not None and prev_ts < hi:
+                fill_ts = (prev_ts // step + 1) * step
+                if fill_ts < lo_tick:
+                    fill_ts = lo_tick
+                while fill_ts <= hi:
                     yield f"{metric}{{{labels_key}}} {prev_val} {fill_ts}"
-                    fill_ts += self.fill_interval_ms
+                    fill_ts += step
 
     # ── VictoriaMetrics ──────────────────────────────────────────────────
 
@@ -699,6 +715,9 @@ Examples:
 
   # Fill up to a fixed point instead of "now" (reproducible re-runs)
   python backfill_metrics.py --until 2026-02-15T00:00:00Z
+
+  # Patch only a window (e.g. a scrape gap) without re-pushing everything
+  python backfill_metrics.py --from 2026-06-29T11:00:00Z --until 2026-06-29T12:30:00Z
         '''
     )
 
@@ -714,6 +733,9 @@ Examples:
     parser.add_argument('--until', type=str, default=None,
                         help='ISO timestamp to carry series forward to '
                              '(default: now, so backfill overlaps the live scrape)')
+    parser.add_argument('--from', dest='since', type=str, default=None,
+                        help='ISO timestamp lower bound: only emit points after it '
+                             '(default: whole history). Use with --until to patch a gap.')
 
     args = parser.parse_args()
 
@@ -723,7 +745,8 @@ Examples:
             batch_size=args.batch_size,
             resume=args.resume,
             fill_interval=args.fill_interval,
-            until=args.until
+            until=args.until,
+            since=args.since
         )
         exporter.run()
     except ValueError as e:
