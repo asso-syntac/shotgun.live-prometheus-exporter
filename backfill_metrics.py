@@ -43,7 +43,7 @@ DB_FILE = Path('/data/shotgun_tickets.db')
 
 class BackfillExporter:
     def __init__(self, dry_run: bool = False, batch_size: int = 1000, resume: bool = False,
-                 fill_interval: int = 300, until: Optional[str] = None):
+                 fill_interval: int = 1800, until: Optional[str] = None):
         if not SHOTGUN_TOKEN:
             raise ValueError("SHOTGUN_TOKEN must be defined in .env file")
         if not SHOTGUN_ORGANIZER_ID:
@@ -57,13 +57,12 @@ class BackfillExporter:
         self.resume = resume
         self.events_cache: Dict[int, str] = {}
 
-        # Fill-forward grid: emit a point every `fill_interval` seconds so the
-        # backfilled series have the same density as the live scrape and render
-        # as a continuous block instead of a sparse "comb".
+        # Epoch-aligned fill grid. Alignment (shared timestamps across series) is
+        # what keeps sum() panels clean; the interval only needs to stay well
+        # under VM's maxStalenessInterval (2h), so 30 min keeps volume sane.
         self.fill_interval_ms = max(1, fill_interval) * 1000
-        # Carry each series' final value forward up to this point. Defaults to
-        # the run time ("now") so backfilled data overlaps the live scrape and
-        # leaves no gap at the handoff. Override with --until for reproducibility.
+        # Carry each series' final value forward up to this point ("now" by
+        # default) so backfilled data overlaps the live scrape with no gap.
         until_ms = self._get_timestamp_ms(until) if until else None
         self.fill_until_ms = until_ms or int(time.time() * 1000)
 
@@ -381,71 +380,54 @@ class BackfillExporter:
 
         return results
 
-    def build_cumulative_lines(self, tickets: List[Dict], event_name: str) -> List[str]:
-        """Build cumulative Prometheus lines for a list of tickets (single event).
+    def iter_cumulative_lines(self, tickets: List[Dict], event_name: str):
+        """Yield cumulative Prometheus lines for a list of tickets (single event).
 
-        After computing cumulative values, emits fill-forward points on an
-        epoch-aligned grid (every self.fill_interval_ms) between real data points
-        AND after the last point of each series, up to self.fill_until_ms ("now"
-        by default). Aligning to a shared grid keeps stacked panels clean, and
-        carrying the final value forward to the handoff point means backfilled
-        series overlap the live scrape with no gap (no "comb", no boundary hole).
+        Fill-forward points are emitted on an epoch-aligned grid (every
+        self.fill_interval_ms) between real data points and up to
+        self.fill_until_ms. The shared grid keeps stacked sum() panels clean.
+
+        Lines are yielded lazily (not materialised) so memory stays bounded even
+        for high-cardinality events spanning months — VictoriaMetrics accepts
+        unordered samples, so no global sort is needed.
         """
-        # Collect all metric events
         raw_events = []
         for ticket in tickets:
             raw_events.extend(self._collect_events_for_ticket(ticket, event_name))
 
         if not raw_events:
-            return []
+            return
 
-        # Sort by timestamp
         raw_events.sort(key=lambda e: e[3])
 
-        # Build cumulative values at each real event timestamp
         cumulative: Dict[str, float] = defaultdict(float)
-        # Track per series: list of (ts_ms, cumulative_value)
         series_points: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-
         for metric, labels_key, increment, ts_ms in raw_events:
             key = f"{metric}|{labels_key}"
             cumulative[key] += increment
             series_points[key].append((ts_ms, cumulative[key]))
 
-        lines = []
-
         for key, points in series_points.items():
             metric, labels_key = key.split('|', 1)
-
             prev_ts = None
             prev_val = None
 
             for ts_ms, val in points:
-                # Fill gap between previous point and this one, on an
-                # epoch-aligned grid so all series share the same timestamps.
                 if prev_ts is not None:
                     fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
                     while fill_ts < ts_ms:
-                        lines.append(f"{metric}{{{labels_key}}} {prev_val} {fill_ts}")
+                        yield f"{metric}{{{labels_key}}} {prev_val} {fill_ts}"
                         fill_ts += self.fill_interval_ms
 
-                # Emit the real point
-                lines.append(f"{metric}{{{labels_key}}} {val} {ts_ms}")
+                yield f"{metric}{{{labels_key}}} {val} {ts_ms}"
                 prev_ts = ts_ms
                 prev_val = val
 
-            # Carry the final value forward up to the handoff point (now, or
-            # --until), so backfilled series overlap the live scrape with no gap.
             if prev_ts is not None and prev_ts < self.fill_until_ms:
                 fill_ts = (prev_ts // self.fill_interval_ms + 1) * self.fill_interval_ms
                 while fill_ts <= self.fill_until_ms:
-                    lines.append(f"{metric}{{{labels_key}}} {prev_val} {fill_ts}")
+                    yield f"{metric}{{{labels_key}}} {prev_val} {fill_ts}"
                     fill_ts += self.fill_interval_ms
-
-        # Sort all lines by timestamp for ordered ingestion
-        lines.sort(key=lambda l: int(l.rsplit(' ', 1)[1]))
-
-        return lines
 
     # ── VictoriaMetrics ──────────────────────────────────────────────────
 
@@ -469,15 +451,27 @@ class BackfillExporter:
             print(f"    Error sending to VictoriaMetrics: {e}")
             return False
 
-    def send_lines_batched(self, lines: List[str]) -> int:
-        """Send lines in batches, return number sent."""
+    def send_lines_batched(self, lines) -> int:
+        """Consume a lines iterable, sending in batches; return number sent.
+
+        Only one batch is held in memory at a time, so a generator of millions
+        of lines streams through without materialising the whole list.
+        """
         sent = 0
-        for i in range(0, len(lines), self.batch_size):
-            batch = lines[i:i + self.batch_size]
+        batch = []
+        for line in lines:
+            batch.append(line)
+            if len(batch) >= self.batch_size:
+                if self.send_to_victoria_metrics(batch):
+                    sent += len(batch)
+                else:
+                    print(f"    Failed batch ending at line {sent + len(batch)}")
+                batch = []
+        if batch:
             if self.send_to_victoria_metrics(batch):
                 sent += len(batch)
             else:
-                print(f"    Failed batch at offset {i}")
+                print(f"    Failed final batch ({len(batch)} lines)")
         return sent
 
     # ── DB helpers ───────────────────────────────────────────────────────
@@ -564,14 +558,10 @@ class BackfillExporter:
             self._mark_event_progress(event_id, 'done', 0, 0)
             return True
 
-        # Build cumulative metric lines
-        lines = self.build_cumulative_lines(tickets, event_name)
-        print(f"    {len(lines)} cumulative metric lines generated")
-
-        # Send to VictoriaMetrics
+        # Stream cumulative metric lines straight to VictoriaMetrics (bounded memory)
         self._mark_event_progress(event_id, 'sending', len(tickets), 0)
-        sent = self.send_lines_batched(lines)
-        print(f"    {sent}/{len(lines)} metric lines sent")
+        sent = self.send_lines_batched(self.iter_cumulative_lines(tickets, event_name))
+        print(f"    {sent} metric lines sent")
 
         # Save tickets to DB
         if not self.dry_run:
@@ -687,8 +677,8 @@ Examples:
   # With custom batch size
   python backfill_metrics.py --batch-size 500
 
-  # Coarser fill grid (less data) — keep it well under maxStalenessInterval
-  python backfill_metrics.py --fill-interval 600
+  # Finer/coarser fill grid — keep it well under maxStalenessInterval (2h)
+  python backfill_metrics.py --fill-interval 900
 
   # Fill up to a fixed point instead of "now" (reproducible re-runs)
   python backfill_metrics.py --until 2026-02-15T00:00:00Z
@@ -701,9 +691,9 @@ Examples:
                         help='Skip events already completed in a previous run')
     parser.add_argument('--batch-size', type=int, default=1000,
                         help='Number of metric lines per batch (default: 1000)')
-    parser.add_argument('--fill-interval', type=int, default=300,
-                        help='Seconds between fill-forward points; match the live '
-                             'scrape interval for a seamless join (default: 300)')
+    parser.add_argument('--fill-interval', type=int, default=1800,
+                        help='Seconds between epoch-aligned fill-forward points; '
+                             'keep well under maxStalenessInterval (default: 1800)')
     parser.add_argument('--until', type=str, default=None,
                         help='ISO timestamp to carry series forward to '
                              '(default: now, so backfill overlaps the live scrape)')
