@@ -51,6 +51,9 @@ class BackfillExporter:
 
         self.session = requests.Session()
         self.session.headers['Authorization'] = f'Bearer {SHOTGUN_TOKEN}'
+        # Dedicated keep-alive session for VM writes: resolves DNS once and reuses
+        # the connection across thousands of batches (avoids flooding CoreDNS).
+        self.vm_session = requests.Session()
         self._last_api_call = 0
         self.dry_run = dry_run
         self.batch_size = batch_size
@@ -431,33 +434,42 @@ class BackfillExporter:
 
     # ── VictoriaMetrics ──────────────────────────────────────────────────
 
-    def send_to_victoria_metrics(self, lines: List[str]) -> bool:
+    def send_to_victoria_metrics(self, lines: List[str], max_retries: int = 5) -> bool:
         if not lines:
             return True
         if self.dry_run:
             return True
 
-        try:
-            url = f"{VICTORIA_METRICS_URL}/api/v1/import/prometheus"
-            response = requests.post(
-                url,
-                data='\n'.join(lines).encode('utf-8'),
-                headers={'Content-Type': 'text/plain'},
-                timeout=60
-            )
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            print(f"    Error sending to VictoriaMetrics: {e}")
-            return False
+        url = f"{VICTORIA_METRICS_URL}/api/v1/import/prometheus"
+        payload = '\n'.join(lines).encode('utf-8')
+        for attempt in range(max_retries):
+            try:
+                response = self.vm_session.post(
+                    url,
+                    data=payload,
+                    headers={'Content-Type': 'text/plain'},
+                    timeout=60
+                )
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = min(2 ** attempt, 30)
+                    print(f"    VM write failed ({e}); retry in {wait}s ({attempt + 1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    print(f"    Error sending to VictoriaMetrics after {max_retries} attempts: {e}")
+                    return False
+        return False
 
-    def send_lines_batched(self, lines) -> int:
-        """Consume a lines iterable, sending in batches; return number sent.
+    def send_lines_batched(self, lines) -> Tuple[int, int]:
+        """Consume a lines iterable, sending in batches; return (sent, failed).
 
         Only one batch is held in memory at a time, so a generator of millions
         of lines streams through without materialising the whole list.
         """
         sent = 0
+        failed = 0
         batch = []
         for line in lines:
             batch.append(line)
@@ -465,14 +477,14 @@ class BackfillExporter:
                 if self.send_to_victoria_metrics(batch):
                     sent += len(batch)
                 else:
-                    print(f"    Failed batch ending at line {sent + len(batch)}")
+                    failed += len(batch)
                 batch = []
         if batch:
             if self.send_to_victoria_metrics(batch):
                 sent += len(batch)
             else:
-                print(f"    Failed final batch ({len(batch)} lines)")
-        return sent
+                failed += len(batch)
+        return sent, failed
 
     # ── DB helpers ───────────────────────────────────────────────────────
 
@@ -560,13 +572,18 @@ class BackfillExporter:
 
         # Stream cumulative metric lines straight to VictoriaMetrics (bounded memory)
         self._mark_event_progress(event_id, 'sending', len(tickets), 0)
-        sent = self.send_lines_batched(self.iter_cumulative_lines(tickets, event_name))
-        print(f"    {sent} metric lines sent")
+        sent, failed = self.send_lines_batched(self.iter_cumulative_lines(tickets, event_name))
 
-        # Save tickets to DB
         if not self.dry_run:
             self.save_tickets_to_db(tickets)
 
+        # Don't mark 'done' if any batch failed → --resume will retry this event.
+        if failed:
+            print(f"    {sent} sent, {failed} FAILED — event left for --resume")
+            self._mark_event_progress(event_id, 'error', len(tickets), sent)
+            return False
+
+        print(f"    {sent} metric lines sent")
         self._mark_event_progress(event_id, 'done', len(tickets), sent)
         return True
 
