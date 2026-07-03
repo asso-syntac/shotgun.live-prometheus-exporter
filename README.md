@@ -110,6 +110,27 @@ A titre indicatif, ~12 000 billets sur 54 evenements generent environ 2M de lign
 | `shotgun_events_total` | status | Nombre d'evenements par statut |
 | `shotgun_event_tickets_left` | event_id, event_name | Places restantes par evenement |
 
+## CLI : lister les dernieres ventes
+
+`sales_cli.py` interroge la base SQLite locale (lecture seule, aucune dependance externe) pour lister les dernieres ventes enregistrees.
+
+```bash
+# Sur le host (utilise ./data/shotgun_tickets.db)
+python3 sales_cli.py                          # 20 dernieres ventes
+python3 sales_cli.py -n 50                    # 50 dernieres ventes
+python3 sales_cli.py --event foreztival       # filtre par nom d'evenement (ou ID)
+python3 sales_cli.py --ticket "early bird"    # filtre par nom de billet
+python3 sales_cli.py --status refunded        # uniquement les remboursements
+python3 sales_cli.py --since 2026-01-01       # ventes depuis une date
+python3 sales_cli.py --list-events            # liste les evenements connus
+python3 sales_cli.py --json                   # sortie JSON
+
+# Dans le conteneur
+docker compose exec shotgun-exporter python sales_cli.py --event foreztival
+```
+
+Les filtres `--event` et `--ticket` font une recherche par sous-chaine insensible a la casse (accents inclus) et se combinent librement avec `--status`, `--since` et `-n`.
+
 ## API de declenchement manuel
 
 L'exporter expose une API sur le port 9091 :
