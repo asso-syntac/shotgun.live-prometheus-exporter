@@ -109,6 +109,18 @@ A titre indicatif, ~12 000 billets sur 54 evenements generent environ 2M de lign
 | `shotgun_tickets_fees_euros_total` | event_id, event_name, fee_type | Frais en euros |
 | `shotgun_events_total` | status | Nombre d'evenements par statut |
 | `shotgun_event_tickets_left` | event_id, event_name | Places restantes par evenement |
+| `shotgun_scans_total` | mode, status | Scans par mode (full/incremental) et issue (complete/incomplete) |
+
+### Semantique des compteurs
+
+Les compteurs sont **recalcules depuis la base SQLite apres chaque scan** : ils
+refletent l'etat courant des billets. `sold_total` ne compte que les billets
+actuellement valides (deja net des annulations — ne pas lui soustraire
+`refunded_total`), `refunded_total` compte les billets rembourses/annules.
+Un scan interrompu (rate limit, reseau) est marque `incomplete` dans
+`shotgun_scans_total` et loggue en erreur : les pages recuperees sont
+enregistrees, mais un full scan incomplet sera retente au cycle suivant et ne
+touche pas au curseur incremental.
 
 ## CLI : lister les dernieres ventes
 
@@ -158,6 +170,7 @@ Toutes les variables sont dans `.env` (voir `.env.example`) :
 | `SHOTGUN_TOKEN` | _(obligatoire)_ | JWT API Shotgun |
 | `SHOTGUN_ORGANIZER_ID` | _(obligatoire)_ | ID de l'organisateur |
 | `SCRAPE_INTERVAL` | `300` | Intervalle de scrape en secondes |
+| `API_RATE_LIMIT_DELAY` | `0.4` | Delai mini entre appels API (s) — 0.4 garde ~25 % de marge sous les 200 appels/min |
 | `EVENTS_FETCH_INTERVAL` | `3600` | Intervalle de refresh des evenements |
 | `FULL_SCAN_INTERVAL` | `86400` | Intervalle du scan complet |
 | `INCLUDE_COHOSTED_EVENTS` | `false` | Inclure les evenements co-organises |
@@ -215,8 +228,10 @@ Tout est dans `./data/` :
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 python shotgun_exporter.py
+
+pytest   # tests (pagination, retries, recalcul des compteurs)
 ```
 
 ## Credits

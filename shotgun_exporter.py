@@ -52,8 +52,9 @@ INCLUDE_COHOSTED_EVENTS = os.getenv('INCLUDE_COHOSTED_EVENTS', 'false').lower() 
 FULL_SCAN_INTERVAL = int(os.getenv('FULL_SCAN_INTERVAL', '86400'))
 EVENTS_FETCH_INTERVAL = int(os.getenv('EVENTS_FETCH_INTERVAL', '3600'))
 
-# Rate limiting: 200 calls/min = 1 call per 300ms minimum
-API_RATE_LIMIT_DELAY = 0.3  # seconds between API calls
+# Shotgun allows 200 calls/min; default 400ms keeps ~25% headroom so long
+# pagination runs don't trip 429s when combined with other calls.
+API_RATE_LIMIT_DELAY = float(os.getenv('API_RATE_LIMIT_DELAY', '0.4'))
 
 # API URLs
 TICKETS_URL = "https://api.shotgun.live/tickets"
@@ -141,6 +142,23 @@ last_scrape_timestamp = Gauge(
     'shotgun_last_scrape_timestamp',
     'Timestamp of last successful scrape'
 )
+
+scans_total = Counter(
+    'shotgun_scans_total',
+    'Ticket scans by mode and outcome',
+    ['mode', 'status']
+)
+
+
+class ScanIncomplete(Exception):
+    """Pagination stopped on a request failure before the true end of data.
+    Carries the tickets fetched so far (safe to upsert)."""
+
+    def __init__(self, tickets: List[Dict], pages: int):
+        super().__init__(f"scan stopped after {pages} page(s), {len(tickets)} ticket(s) fetched")
+        self.tickets = tickets
+        self.pages = pages
+
 
 # Flask API for manual triggers
 app = Flask(__name__)
@@ -297,174 +315,122 @@ class ShotgunExporter:
         conn.close()
         logger.info(f"Updated events cache: {len(events)} events")
 
-    def _restore_counters_from_db(self, conn: sqlite3.Connection):
-        cursor = conn.cursor()
+    TICKET_COUNTERS = (
+        tickets_sold_total, tickets_revenue_total, tickets_by_channel_total,
+        tickets_refunded_total, tickets_scanned_total,
+        tickets_by_payment_method_total, tickets_by_utm_source_total,
+        tickets_by_utm_medium_total, tickets_by_visibility_total,
+        tickets_fees_total,
+    )
 
-        # Tickets sold and revenue (deal_price is in cents, convert to euros)
+    def _counter_rows(self, conn: sqlite3.Connection) -> List[Tuple[Counter, Dict[str, str], float]]:
+        """Ticket counter values as a pure function of the DB. sold/revenue
+        only count currently-valid tickets (net of cancellations); refunded
+        counts refunded/canceled ones."""
+        cursor = conn.cursor()
+        rows: List[Tuple[Counter, Dict[str, str], float]] = []
+
+        def base(event_id, **extra) -> Dict[str, str]:
+            return {'event_id': str(event_id), 'event_name': self._get_event_name(event_id), **extra}
+
         cursor.execute('''
             SELECT event_id, deal_title, COUNT(*), SUM(deal_price)
-            FROM tickets
-            WHERE ticket_status = 'valid'
+            FROM tickets WHERE ticket_status = 'valid'
             GROUP BY event_id, deal_title
         ''')
-        for row in cursor.fetchall():
-            event_id, deal_title, count, total_revenue_cents = row
-            event_name = self._get_event_name(event_id)
-            ticket_title = deal_title or 'Unknown Ticket'
-            tickets_sold_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                ticket_title=ticket_title
-            ).inc(count)
-            # Convert cents to euros
-            total_revenue_euros = (total_revenue_cents or 0) / 100.0
-            tickets_revenue_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                ticket_title=ticket_title
-            ).inc(total_revenue_euros)
+        for event_id, deal_title, count, revenue_cents in cursor.fetchall():
+            labels = base(event_id, ticket_title=deal_title or 'Unknown Ticket')
+            rows.append((tickets_sold_total, labels, count))
+            rows.append((tickets_revenue_total, labels, (revenue_cents or 0) / 100.0))
 
-        # By channel
         cursor.execute('''
             SELECT event_id, deal_channel, COUNT(*)
-            FROM tickets
-            WHERE ticket_status = 'valid'
+            FROM tickets WHERE ticket_status = 'valid'
             GROUP BY event_id, deal_channel
         ''')
-        for row in cursor.fetchall():
-            event_id, channel, count = row
-            event_name = self._get_event_name(event_id)
-            tickets_by_channel_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                channel=channel or 'unknown'
-            ).inc(count)
+        for event_id, channel, count in cursor.fetchall():
+            rows.append((tickets_by_channel_total, base(event_id, channel=channel or 'unknown'), count))
 
-        # Refunded tickets
         cursor.execute('''
             SELECT event_id, deal_title, COUNT(*)
-            FROM tickets
-            WHERE ticket_status IN ('refunded', 'canceled')
+            FROM tickets WHERE ticket_status IN ('refunded', 'canceled')
             GROUP BY event_id, deal_title
         ''')
-        for row in cursor.fetchall():
-            event_id, deal_title, count = row
-            event_name = self._get_event_name(event_id)
-            ticket_title = deal_title or 'Unknown Ticket'
-            tickets_refunded_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                ticket_title=ticket_title
-            ).inc(count)
+        for event_id, deal_title, count in cursor.fetchall():
+            rows.append((tickets_refunded_total,
+                         base(event_id, ticket_title=deal_title or 'Unknown Ticket'), count))
 
-        # Scanned tickets
         cursor.execute('''
             SELECT event_id, COUNT(*)
-            FROM tickets
-            WHERE ticket_scanned_at IS NOT NULL
+            FROM tickets WHERE ticket_scanned_at IS NOT NULL
             GROUP BY event_id
         ''')
-        for row in cursor.fetchall():
-            event_id, count = row
-            event_name = self._get_event_name(event_id)
-            tickets_scanned_total.labels(
-                event_id=str(event_id),
-                event_name=event_name
-            ).inc(count)
+        for event_id, count in cursor.fetchall():
+            rows.append((tickets_scanned_total, base(event_id), count))
 
-        # By payment method
-        cursor.execute('''
-            SELECT event_id, payment_method, COUNT(*)
-            FROM tickets
-            WHERE ticket_status = 'valid'
-            GROUP BY event_id, payment_method
-        ''')
-        for row in cursor.fetchall():
-            event_id, payment_method, count = row
-            event_name = self._get_event_name(event_id)
-            tickets_by_payment_method_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                payment_method=payment_method or 'unknown'
-            ).inc(count)
+        for metric, column in ((tickets_by_payment_method_total, 'payment_method'),
+                               (tickets_by_utm_source_total, 'utm_source'),
+                               (tickets_by_utm_medium_total, 'utm_medium')):
+            cursor.execute(f'''
+                SELECT event_id, {column}, COUNT(*)
+                FROM tickets WHERE ticket_status = 'valid'
+                GROUP BY event_id, {column}
+            ''')
+            for event_id, value, count in cursor.fetchall():
+                rows.append((metric, base(event_id, **{column: value or 'unknown'}), count))
 
-        # By UTM source
-        cursor.execute('''
-            SELECT event_id, utm_source, COUNT(*)
-            FROM tickets
-            WHERE ticket_status = 'valid'
-            GROUP BY event_id, utm_source
-        ''')
-        for row in cursor.fetchall():
-            event_id, utm_source, count = row
-            event_name = self._get_event_name(event_id)
-            tickets_by_utm_source_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                utm_source=utm_source or 'unknown'
-            ).inc(count)
-
-        # By UTM medium
-        cursor.execute('''
-            SELECT event_id, utm_medium, COUNT(*)
-            FROM tickets
-            WHERE ticket_status = 'valid'
-            GROUP BY event_id, utm_medium
-        ''')
-        for row in cursor.fetchall():
-            event_id, utm_medium, count = row
-            event_name = self._get_event_name(event_id)
-            tickets_by_utm_medium_total.labels(
-                event_id=str(event_id),
-                event_name=event_name,
-                utm_medium=utm_medium or 'unknown'
-            ).inc(count)
-
-        # By visibility (need to parse JSON array)
         cursor.execute('''
             SELECT event_id, deal_visibilities, COUNT(*)
-            FROM tickets
-            WHERE ticket_status = 'valid' AND deal_visibilities IS NOT NULL
+            FROM tickets WHERE ticket_status = 'valid' AND deal_visibilities IS NOT NULL
             GROUP BY event_id, deal_visibilities
         ''')
-        for row in cursor.fetchall():
-            event_id, visibilities_json, count = row
-            event_name = self._get_event_name(event_id)
+        visibility_counts: Dict[Tuple[int, str], int] = {}
+        for event_id, visibilities_json, count in cursor.fetchall():
             try:
                 visibilities = json.loads(visibilities_json) if visibilities_json else []
-                for visibility in visibilities:
-                    tickets_by_visibility_total.labels(
-                        event_id=str(event_id),
-                        event_name=event_name,
-                        visibility=visibility
-                    ).inc(count)
             except json.JSONDecodeError:
-                pass
+                continue
+            for visibility in visibilities:
+                key = (event_id, visibility)
+                visibility_counts[key] = visibility_counts.get(key, 0) + count
+        for (event_id, visibility), count in visibility_counts.items():
+            rows.append((tickets_by_visibility_total, base(event_id, visibility=visibility), count))
 
-        # Fees (convert cents to euros)
         cursor.execute('''
             SELECT event_id, SUM(deal_service_fee), SUM(deal_user_service_fee)
-            FROM tickets
-            WHERE ticket_status = 'valid'
+            FROM tickets WHERE ticket_status = 'valid'
             GROUP BY event_id
         ''')
-        for row in cursor.fetchall():
-            event_id, service_fee_cents, user_service_fee_cents = row
-            event_name = self._get_event_name(event_id)
+        for event_id, service_fee_cents, user_fee_cents in cursor.fetchall():
             if service_fee_cents:
-                tickets_fees_total.labels(
-                    event_id=str(event_id),
-                    event_name=event_name,
-                    fee_type='service_fee'
-                ).inc(service_fee_cents / 100.0)
-            if user_service_fee_cents:
-                tickets_fees_total.labels(
-                    event_id=str(event_id),
-                    event_name=event_name,
-                    fee_type='user_service_fee'
-                ).inc(user_service_fee_cents / 100.0)
+                rows.append((tickets_fees_total,
+                             base(event_id, fee_type='service_fee'), service_fee_cents / 100.0))
+            if user_fee_cents:
+                rows.append((tickets_fees_total,
+                             base(event_id, fee_type='user_service_fee'), user_fee_cents / 100.0))
 
+        return rows
+
+    def _restore_counters_from_db(self, conn: sqlite3.Connection):
+        for metric, labels, value in self._counter_rows(conn):
+            metric.labels(**labels).inc(value)
         logger.info("Counters restored from database")
+
+    def _recompute_counters(self):
+        """Reset ticket counters to the DB state. Run after every scan so
+        status changes (cancellations, resales) leave the valid-only
+        counters instead of drifting until the next process restart."""
+        conn = sqlite3.connect(self.DB_FILE)
+        try:
+            rows = self._counter_rows(conn)
+        finally:
+            conn.close()
+        # values are precomputed: the cleared window lasts microseconds
+        for metric in self.TICKET_COUNTERS:
+            metric._metrics.clear()
+        for metric, labels, value in rows:
+            metric.labels(**labels).inc(value)
+        logger.info("Counters recomputed from database")
 
     def _rate_limit(self):
         """Enforce rate limiting: 200 calls/min = minimum 300ms between calls"""
@@ -523,16 +489,24 @@ class ShotgunExporter:
                     return None
 
             except requests.exceptions.RequestException as e:
-                # Retry on 5xx errors (server errors), but not on 4xx (client errors)
-                if hasattr(e, 'response') and e.response is not None:
-                    status_code = e.response.status_code
-                    if 500 <= status_code < 600:
-                        logger.warning(f"Server error {status_code} (attempt {attempt + 1}/{max_retries}): {e}")
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt  # Exponential backoff
-                            logger.info(f"Retrying in {wait_time}s...")
-                            time.sleep(wait_time)
-                            continue
+                # Retry on 5xx and 429; other 4xx are permanent client errors
+                status_code = e.response.status_code if getattr(e, 'response', None) is not None else None
+                if status_code == 429 and attempt < max_retries - 1:
+                    # the 200 calls/min budget is a rolling window: wait long
+                    # enough for it to refill (Retry-After when provided)
+                    retry_after = e.response.headers.get('Retry-After', '')
+                    wait_time = int(retry_after) if retry_after.isdigit() else 15 * (2 ** attempt)
+                    logger.warning(f"Rate limited (429), retrying in {wait_time}s "
+                                   f"(attempt {attempt + 1}/{max_retries})")
+                    api_requests_total.labels(endpoint=url.split('/')[-1], status='rate_limited').inc()
+                    time.sleep(wait_time)
+                    continue
+                if status_code is not None and 500 <= status_code < 600 and attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Server error {status_code} (attempt {attempt + 1}/{max_retries}), "
+                                   f"retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                    continue
 
                 logger.error(f"Error during request: {e}")
                 api_requests_total.labels(endpoint=url.split('/')[-1], status='error').inc()
@@ -676,12 +650,16 @@ class ShotgunExporter:
 
         page_count = 0
         last_after_value = None
+        failed = False
 
         while True:
             try:
                 data = self._make_request(TICKETS_URL, params, use_token=True)
-                if not data:
-                    logger.warning(f"No data received at page {page_count + 1}, stopping pagination")
+                if data is None:
+                    # request failure, NOT the end of data: the remaining
+                    # pages hold the most recently updated tickets
+                    logger.error(f"Request failed at page {page_count + 1}, scan is incomplete")
+                    failed = True
                     break
 
                 tickets = data.get('data', [])
@@ -695,12 +673,11 @@ class ShotgunExporter:
                 logger.info(f"Page {page_count}: {len(tickets)} tickets fetched (total: {len(all_tickets)})")
 
                 # Track the last ticket for next incremental scan
-                if tickets:
-                    last_ticket = tickets[-1]
-                    ticket_updated_at = last_ticket.get('ticket_updated_at', '')
-                    ticket_id = last_ticket.get('ticket_id', '')
-                    if ticket_updated_at and ticket_id:
-                        last_after_value = f"{ticket_updated_at}_{ticket_id}"
+                last_ticket = tickets[-1]
+                ticket_updated_at = last_ticket.get('ticket_updated_at', '')
+                ticket_id = last_ticket.get('ticket_id', '')
+                if ticket_updated_at and ticket_id:
+                    last_after_value = f"{ticket_updated_at}_{ticket_id}"
 
                 # Check for next page
                 pagination_info = data.get('pagination', {})
@@ -716,18 +693,24 @@ class ShotgunExporter:
                     logger.debug(f"After for next page: {next_after[:50]}...")
                 else:
                     logger.warning("Could not extract 'after' from next URL, stopping")
+                    failed = True
                     break
 
             except Exception as e:
                 logger.error(f"Error fetching page {page_count + 1}: {e}")
+                failed = True
                 break
 
-        # Save last after value for next incremental scan
-        if last_after_value:
+        # Advance the incremental cursor. An incomplete FULL scan must NOT
+        # save it: that would rewind the cursor months back and lock the
+        # next cycles into re-fetching (and re-429ing) the whole history.
+        if last_after_value and (not failed or not full_scan):
             self._save_last_ticket_after(last_after_value)
             logger.debug(f"Saved last_ticket_after: {last_after_value[:50]}...")
 
         logger.info(f"Total: {len(all_tickets)} tickets fetched in {page_count} page(s)")
+        if failed:
+            raise ScanIncomplete(all_tickets, page_count)
         return all_tickets
 
     def fetch_events(self) -> List[Dict]:
@@ -869,7 +852,8 @@ class ShotgunExporter:
         ''', (ticket_id, old_status, new_status, datetime.now().isoformat()))
 
     def process_new_tickets(self, tickets: List[Dict]):
-        """Process tickets from the new API and update metrics"""
+        """Upsert tickets into the DB. Counters are NOT updated here: they
+        are recomputed from the DB after each scan (_recompute_counters)."""
         new_tickets_count = 0
         updated_tickets_count = 0
         refunds_detected = 0
@@ -881,132 +865,28 @@ class ShotgunExporter:
                 if not ticket_id:
                     continue
 
-                # Get event info
-                event_id = ticket.get('event_id')
-                event_name = self._get_event_name(event_id)
-                
-                # Get ticket info with new field names
-                ticket_title = self._normalize_ticket_title(ticket)
                 ticket_status = ticket.get('ticket_status', 'unknown')
-                channel = ticket.get('deal_channel', 'unknown')
-                deal_price_cents = ticket.get('deal_price', 0)
-                deal_price_euros = deal_price_cents / 100.0  # Convert cents to euros
                 scanned = ticket.get('ticket_scanned_at') is not None
-                
-                # New fields for additional metrics
-                payment_method = ticket.get('payment_method', 'unknown')
-                utm_source = ticket.get('utm_source', 'unknown')
-                utm_medium = ticket.get('utm_medium', 'unknown')
-                visibilities = ticket.get('deal_visibilities', [])
-                service_fee_cents = ticket.get('deal_service_fee', 0)
-                user_service_fee_cents = ticket.get('deal_user_service_fee', 0)
 
                 existing_ticket = self._get_ticket_from_db(conn, ticket_id)
 
                 if existing_ticket is None:
                     new_tickets_count += 1
                     self._save_ticket_to_db(conn, ticket, is_new=True)
+                    continue
 
-                    if ticket_status == 'valid':
-                        # Core metrics
-                        tickets_sold_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            ticket_title=ticket_title
-                        ).inc()
+                old_status = existing_ticket['ticket_status']
+                if old_status != ticket_status:
+                    updated_tickets_count += 1
+                    self._save_ticket_to_db(conn, ticket, is_new=False)
+                    self._record_status_change(conn, ticket_id, old_status, ticket_status)
+                    logger.info(f"Status change detected for ticket {ticket_id}: {old_status} -> {ticket_status}")
+                    if old_status == 'valid' and ticket_status in ['refunded', 'canceled', 'resold']:
+                        refunds_detected += 1
 
-                        tickets_revenue_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            ticket_title=ticket_title
-                        ).inc(deal_price_euros)
-
-                        tickets_by_channel_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            channel=channel or 'unknown'
-                        ).inc()
-
-                        # New metrics
-                        tickets_by_payment_method_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            payment_method=payment_method or 'unknown'
-                        ).inc()
-
-                        tickets_by_utm_source_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            utm_source=utm_source or 'unknown'
-                        ).inc()
-
-                        tickets_by_utm_medium_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            utm_medium=utm_medium or 'unknown'
-                        ).inc()
-
-                        # Visibility metrics (one entry per visibility type)
-                        for visibility in visibilities:
-                            tickets_by_visibility_total.labels(
-                                event_id=str(event_id),
-                                event_name=event_name,
-                                visibility=visibility
-                            ).inc()
-
-                        # Fees metrics (in euros)
-                        if service_fee_cents:
-                            tickets_fees_total.labels(
-                                event_id=str(event_id),
-                                event_name=event_name,
-                                fee_type='service_fee'
-                            ).inc(service_fee_cents / 100.0)
-
-                        if user_service_fee_cents:
-                            tickets_fees_total.labels(
-                                event_id=str(event_id),
-                                event_name=event_name,
-                                fee_type='user_service_fee'
-                            ).inc(user_service_fee_cents / 100.0)
-
-                    elif ticket_status in ['refunded', 'canceled', 'resold']:
-                        tickets_refunded_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name,
-                            ticket_title=ticket_title
-                        ).inc()
-
-                    if scanned:
-                        tickets_scanned_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name
-                        ).inc()
-
-                else:
-                    old_status = existing_ticket['ticket_status']
-
-                    if old_status != ticket_status:
-                        updated_tickets_count += 1
-                        self._save_ticket_to_db(conn, ticket, is_new=False)
-                        self._record_status_change(conn, ticket_id, old_status, ticket_status)
-
-                        logger.info(f"Status change detected for ticket {ticket_id}: {old_status} -> {ticket_status}")
-
-                        if old_status == 'valid' and ticket_status in ['refunded', 'canceled', 'resold']:
-                            refunds_detected += 1
-                            tickets_refunded_total.labels(
-                                event_id=str(event_id),
-                                event_name=event_name,
-                                ticket_title=ticket_title
-                            ).inc()
-
-                    old_scanned = existing_ticket.get('ticket_scanned_at') is not None
-                    if scanned and not old_scanned:
-                        tickets_scanned_total.labels(
-                            event_id=str(event_id),
-                            event_name=event_name
-                        ).inc()
-                        self._save_ticket_to_db(conn, ticket, is_new=False)
+                old_scanned = existing_ticket.get('ticket_scanned_at') is not None
+                if scanned and not old_scanned:
+                    self._save_ticket_to_db(conn, ticket, is_new=False)
 
             conn.commit()
             logger.info(f"{new_tickets_count} new ticket(s), {updated_tickets_count} updated, {refunds_detected} refund(s) detected")
@@ -1102,15 +982,13 @@ class ShotgunExporter:
                         status=sentry_sdk.crons.MonitorStatus.IN_PROGRESS,
                     )
                 try:
-                    all_tickets = self.fetch_all_tickets(full_scan=True)
-                    self.process_new_tickets(all_tickets)
-                    self._mark_full_scan_done()
-                    logger.info(f"Full scan completed, next full scan in {FULL_SCAN_INTERVAL/3600:.1f} hours")
+                    completed = self._run_scan(full_scan=True)
                     if SENTRY_DSN:
                         sentry_sdk.crons.capture_checkin(
                             check_in_id=check_in_id,
                             monitor_slug=monitor_slug,
-                            status=sentry_sdk.crons.MonitorStatus.OK,
+                            status=(sentry_sdk.crons.MonitorStatus.OK if completed
+                                    else sentry_sdk.crons.MonitorStatus.ERROR),
                         )
                 except Exception as e:
                     if SENTRY_DSN:
@@ -1121,11 +999,10 @@ class ShotgunExporter:
                         )
                     raise
             else:
-                # Incremental scan using 'after' parameter
-                all_tickets = self.fetch_all_tickets(full_scan=False)
-                self.process_new_tickets(all_tickets)
+                completed = self._run_scan(full_scan=False)
 
-            last_scrape_timestamp.set(time.time())
+            if completed:
+                last_scrape_timestamp.set(time.time())
 
             elapsed = time.time() - start_time
             logger.info(f"Metrics collection completed in {elapsed:.2f}s")
@@ -1134,6 +1011,32 @@ class ShotgunExporter:
             logger.error(f"Error during metrics collection: {e}", exc_info=True)
         finally:
             self._scan_lock.release()
+
+    def _run_scan(self, full_scan: bool) -> bool:
+        """Fetch + upsert + recompute counters. Returns True if the scan
+        reached the end of pagination. Partial results are still upserted
+        (they are plain upserts), but an incomplete full scan is NOT marked
+        done so the next cycle retries it."""
+        mode = 'full' if full_scan else 'incremental'
+        try:
+            tickets = self.fetch_all_tickets(full_scan=full_scan)
+        except ScanIncomplete as e:
+            self.process_new_tickets(e.tickets)
+            self._recompute_counters()
+            scans_total.labels(mode=mode, status='incomplete').inc()
+            if full_scan:
+                logger.error(f"Full scan INCOMPLETE ({e}) — will retry next cycle")
+            else:
+                logger.warning(f"Incremental scan incomplete ({e}) — resumes from saved cursor")
+            return False
+
+        self.process_new_tickets(tickets)
+        self._recompute_counters()
+        scans_total.labels(mode=mode, status='complete').inc()
+        if full_scan:
+            self._mark_full_scan_done()
+            logger.info(f"Full scan completed, next full scan in {FULL_SCAN_INTERVAL/3600:.1f} hours")
+        return True
 
     def run(self):
         logger.info(f"Starting Shotgun exporter on port {EXPORTER_PORT}")
@@ -1174,19 +1077,19 @@ class ShotgunExporter:
                         status=sentry_sdk.crons.MonitorStatus.IN_PROGRESS,
                     )
 
-                all_tickets = self.fetch_all_tickets(full_scan=True)
-                self.process_new_tickets(all_tickets)
-                self._mark_full_scan_done()
+                completed = self._run_scan(full_scan=True)
 
                 if SENTRY_DSN:
                     sentry_sdk.crons.capture_checkin(
                         check_in_id=check_in_id,
                         monitor_slug=monitor_slug,
-                        status=sentry_sdk.crons.MonitorStatus.OK,
+                        status=(sentry_sdk.crons.MonitorStatus.OK if completed
+                                else sentry_sdk.crons.MonitorStatus.ERROR),
                     )
 
-                logger.info("Manual full scan completed successfully")
-                return True
+                if completed:
+                    logger.info("Manual full scan completed successfully")
+                return completed
             except Exception as e:
                 logger.error(f"Error during manual full scan: {e}", exc_info=True)
                 if SENTRY_DSN:
@@ -1205,10 +1108,10 @@ class ShotgunExporter:
         with self._scan_lock:
             logger.info("Lock acquired, starting incremental scan...")
             try:
-                all_tickets = self.fetch_all_tickets(full_scan=False)
-                self.process_new_tickets(all_tickets)
-                logger.info("Manual incremental scan completed successfully")
-                return True
+                completed = self._run_scan(full_scan=False)
+                if completed:
+                    logger.info("Manual incremental scan completed successfully")
+                return completed
             except Exception as e:
                 logger.error(f"Error during manual incremental scan: {e}", exc_info=True)
                 return False
