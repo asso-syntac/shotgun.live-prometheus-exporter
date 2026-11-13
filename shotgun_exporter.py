@@ -52,9 +52,9 @@ INCLUDE_COHOSTED_EVENTS = os.getenv('INCLUDE_COHOSTED_EVENTS', 'false').lower() 
 FULL_SCAN_INTERVAL = int(os.getenv('FULL_SCAN_INTERVAL', '86400'))
 EVENTS_FETCH_INTERVAL = int(os.getenv('EVENTS_FETCH_INTERVAL', '3600'))
 
-# Shotgun allows 200 calls/min; default 400ms keeps ~25% headroom so long
-# pagination runs don't trip 429s when combined with other calls.
-API_RATE_LIMIT_DELAY = float(os.getenv('API_RATE_LIMIT_DELAY', '0.4'))
+# Shotgun allows 100 calls/min per IP (tickets API doc); default 700ms (~85/min)
+# keeps ~15% headroom so long pagination runs don't trip 429s.
+API_RATE_LIMIT_DELAY = float(os.getenv('API_RATE_LIMIT_DELAY', '0.7'))
 
 # API URLs
 TICKETS_URL = "https://api.shotgun.live/tickets"
@@ -433,7 +433,7 @@ class ShotgunExporter:
         logger.info("Counters recomputed from database")
 
     def _rate_limit(self):
-        """Enforce rate limiting: 200 calls/min = minimum 300ms between calls"""
+        """Enforce rate limiting: 100 calls/min per IP, see API_RATE_LIMIT_DELAY"""
         now = time.time()
         elapsed = now - self._last_api_call
         if elapsed < API_RATE_LIMIT_DELAY:
@@ -492,7 +492,7 @@ class ShotgunExporter:
                 # Retry on 5xx and 429; other 4xx are permanent client errors
                 status_code = e.response.status_code if getattr(e, 'response', None) is not None else None
                 if status_code == 429 and attempt < max_retries - 1:
-                    # the 200 calls/min budget is a rolling window: wait long
+                    # the 100 calls/min budget is a rolling window: wait long
                     # enough for it to refill (Retry-After when provided)
                     retry_after = e.response.headers.get('Retry-After', '')
                     wait_time = int(retry_after) if retry_after.isdigit() else 15 * (2 ** attempt)

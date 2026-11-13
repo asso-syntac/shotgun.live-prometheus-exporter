@@ -35,8 +35,8 @@ VICTORIA_METRICS_URL = os.getenv('VICTORIA_METRICS_URL', 'http://victoria-metric
 TICKETS_URL = "https://api.shotgun.live/tickets"
 EVENTS_URL = f"https://smartboard-api.shotgun.live/api/shotgun/organizers/{SHOTGUN_ORGANIZER_ID}/events"
 
-# Rate limiting: 200 calls/min = 300ms between calls
-API_RATE_LIMIT_DELAY = 0.3
+# Rate limiting: Shotgun allows 100 calls/min per IP, 700ms = ~85/min
+API_RATE_LIMIT_DELAY = 0.7
 
 DB_FILE = Path('/data/shotgun_tickets.db')
 

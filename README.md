@@ -59,7 +59,7 @@ Le backfill recupere l'historique complet des billets depuis l'API Shotgun et in
 - Traite les evenements un par un (faible conso memoire)
 - Calcule des **compteurs cumulatifs** (valeur = total courant a chaque instant)
 - Remplit les trous entre les points reels (fill-forward toutes les heures) pour eviter les gaps dans Grafana
-- Respecte le rate limit de l'API Shotgun (200 appels/min) avec retry automatique sur 429 et 5xx
+- Respecte le rate limit de l'API Shotgun (100 appels/min par IP) avec retry automatique sur 429 et 5xx
 - Progression sauvegardee en SQLite : reprise possible apres interruption
 
 ### Lancer le backfill
@@ -170,7 +170,7 @@ Toutes les variables sont dans `.env` (voir `.env.example`) :
 | `SHOTGUN_TOKEN` | _(obligatoire)_ | JWT API Shotgun |
 | `SHOTGUN_ORGANIZER_ID` | _(obligatoire)_ | ID de l'organisateur |
 | `SCRAPE_INTERVAL` | `300` | Intervalle de scrape en secondes |
-| `API_RATE_LIMIT_DELAY` | `0.4` | Delai mini entre appels API (s) — 0.4 garde ~25 % de marge sous les 200 appels/min |
+| `API_RATE_LIMIT_DELAY` | `0.7` | Delai mini entre appels API (s) — 0.7 garde ~15 % de marge sous les 100 appels/min par IP |
 | `EVENTS_FETCH_INTERVAL` | `3600` | Intervalle de refresh des evenements |
 | `FULL_SCAN_INTERVAL` | `86400` | Intervalle du scan complet |
 | `INCLUDE_COHOSTED_EVENTS` | `false` | Inclure les evenements co-organises |
