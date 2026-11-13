@@ -7,6 +7,7 @@ Adapted for the new /tickets API schema.
 import os
 import sys
 import json
+import re
 import sqlite3
 import argparse
 import requests
@@ -19,6 +20,11 @@ load_dotenv()
 
 DB_FILE = Path('/data/shotgun_tickets.db')
 VICTORIA_METRICS_URL = os.getenv('VICTORIA_METRICS_URL', 'http://victoria-metrics:8428')
+# Optional "name=value" label added to every imported sample (VM extra_label),
+# e.g. organizer=123456, so several exporters can share one VictoriaMetrics.
+VM_EXTRA_LABEL = os.getenv('VM_EXTRA_LABEL', '')
+if VM_EXTRA_LABEL and not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*=[^"\\]+', VM_EXTRA_LABEL):
+    sys.exit(f"VM_EXTRA_LABEL must be name=value, got {VM_EXTRA_LABEL!r}")
 
 
 def get_all_events(conn: sqlite3.Connection) -> List[Tuple[int, str, int]]:
@@ -132,7 +138,11 @@ def delete_event_metrics(event_id: int, event_name: str, dry_run: bool = False) 
     print(f"\n{'[DRY RUN] ' if dry_run else ''}Deleting metrics for event {event_id} ({event_name})...")
 
     for metric in metrics_to_delete:
-        match_filter = f'{metric}{{event_id="{event_id}"}}'
+        label_match = f'event_id="{event_id}"'
+        if VM_EXTRA_LABEL:  # never touch another exporter's series (cohosted events share event_id)
+            name, value = VM_EXTRA_LABEL.split('=', 1)
+            label_match += f',{name}="{value}"'
+        match_filter = f'{metric}{{{label_match}}}'
 
         if dry_run:
             print(f"  Would delete: {match_filter}")
@@ -389,6 +399,7 @@ def reimport_event_data(conn: sqlite3.Connection, event_id: int, dry_run: bool =
         response = requests.post(
             url,
             data=data.encode('utf-8'),
+            params={'extra_label': VM_EXTRA_LABEL} if VM_EXTRA_LABEL else None,
             headers={'Content-Type': 'text/plain'},
             timeout=60
         )

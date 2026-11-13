@@ -174,6 +174,7 @@ Toutes les variables sont dans `.env` (voir `.env.example`) :
 | `EVENTS_FETCH_INTERVAL` | `3600` | Intervalle de refresh des evenements |
 | `FULL_SCAN_INTERVAL` | `86400` | Intervalle du scan complet |
 | `INCLUDE_COHOSTED_EVENTS` | `false` | Inclure les evenements co-organises |
+| `VM_EXTRA_LABEL` | _(vide)_ | Label `nom=valeur` ajoute aux imports VM du backfill/reimport (ex. `organizer=123456`) pour partager un VM entre plusieurs exporters |
 | `SENTRY_DSN` | _(vide)_ | DSN Sentry (optionnel) |
 | `GF_USER_ID` | `1000` | UID pour le conteneur Grafana |
 

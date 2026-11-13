@@ -31,6 +31,11 @@ SHOTGUN_TOKEN = os.getenv('SHOTGUN_TOKEN')
 SHOTGUN_ORGANIZER_ID = os.getenv('SHOTGUN_ORGANIZER_ID')
 INCLUDE_COHOSTED_EVENTS = os.getenv('INCLUDE_COHOSTED_EVENTS', 'false').lower() == 'true'
 VICTORIA_METRICS_URL = os.getenv('VICTORIA_METRICS_URL', 'http://victoria-metrics:8428')
+# Optional "name=value" label added to every imported sample (VM extra_label),
+# e.g. organizer=123456, so several exporters can share one VictoriaMetrics.
+VM_EXTRA_LABEL = os.getenv('VM_EXTRA_LABEL', '')
+if VM_EXTRA_LABEL and not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*=[^"\\]+', VM_EXTRA_LABEL):
+    sys.exit(f"VM_EXTRA_LABEL must be name=value, got {VM_EXTRA_LABEL!r}")
 
 TICKETS_URL = "https://api.shotgun.live/tickets"
 EVENTS_URL = f"https://smartboard-api.shotgun.live/api/shotgun/organizers/{SHOTGUN_ORGANIZER_ID}/events"
@@ -463,6 +468,7 @@ class BackfillExporter:
                 response = self.vm_session.post(
                     url,
                     data=payload,
+                    params={'extra_label': VM_EXTRA_LABEL} if VM_EXTRA_LABEL else None,
                     headers={'Content-Type': 'text/plain'},
                     timeout=60
                 )
