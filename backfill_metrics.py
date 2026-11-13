@@ -184,7 +184,8 @@ class BackfillExporter:
                 response = self.session.get(url, params=full_params, timeout=120)
 
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
+                    ra = response.headers.get('Retry-After', '')
+                    retry_after = int(ra) if ra.isdigit() else 60
                     print(f"    Rate limited (429), waiting {retry_after}s ({attempt + 1}/{max_retries})...")
                     time.sleep(retry_after)
                     continue
@@ -212,12 +213,11 @@ class BackfillExporter:
         print("Fetching events...")
 
         future_data = self._make_request(EVENTS_URL, use_token=False)
-        future = future_data.get('data', []) if future_data else []
-
         past_data = self._make_request(EVENTS_URL, {'past_events': 'true', 'limit': 100}, use_token=False)
-        past = past_data.get('data', []) if past_data else []
+        if future_data is None or past_data is None:
+            raise RuntimeError("Events fetch failed")
 
-        all_events = future + past
+        all_events = future_data.get('data', []) + past_data.get('data', [])
         print(f"Fetched {len(all_events)} events")
 
         conn = sqlite3.connect(DB_FILE)
@@ -256,8 +256,9 @@ class BackfillExporter:
         page = 0
         while True:
             data = self._make_request(TICKETS_URL, params, use_token=True)
-            if not data:
-                break
+            if data is None:
+                # a failed page is NOT the end of data: never mark a partial event 'done'
+                raise RuntimeError(f"tickets request failed at page {page + 1}")
 
             tickets = data.get('data', [])
             if not tickets:
@@ -273,15 +274,10 @@ class BackfillExporter:
             if not next_url:
                 break
 
-            try:
-                parsed = urlparse(next_url)
-                after_values = parse_qs(parsed.query).get('after', [])
-                if after_values:
-                    params['after'] = unquote(after_values[0])
-                else:
-                    break
-            except Exception:
-                break
+            after_values = parse_qs(urlparse(next_url).query).get('after')
+            if not after_values:
+                raise RuntimeError(f"no 'after' in next page URL at page {page}")
+            params['after'] = unquote(after_values[0])
 
         return all_tickets
 
@@ -377,7 +373,8 @@ class BackfillExporter:
                                 f'event_id="{eid}",event_name="{ename}",fee_type="user_service_fee"',
                                 usf / 100.0, ts))
 
-        elif status in ['refunded', 'canceled', 'resold']:
+        # 'resold' is not a refund (a new valid ticket replaces it) — same rule as the exporter
+        elif status in ('refunded', 'canceled'):
             cancel_ts = self._get_timestamp_ms(ticket.get('ticket_canceled_at') or ordered_at)
             if cancel_ts:
                 results.append(('shotgun_tickets_refunded_total', base, 1, cancel_ts))
@@ -638,6 +635,7 @@ class BackfillExporter:
         success = 0
         skipped = 0
         failed = 0
+        interrupted = False
 
         for i, (eid, ename) in enumerate(event_list):
             if eid in completed:
@@ -653,14 +651,16 @@ class BackfillExporter:
             except KeyboardInterrupt:
                 print(f"\n\nInterrupted! Progress saved. Resume with --resume")
                 self._mark_event_progress(eid, 'interrupted')
+                interrupted = True
                 break
             except Exception as e:
                 print(f"    ERROR: {e}")
                 self._mark_event_progress(eid, 'error')
                 failed += 1
 
-        # Step 3: Update exporter state
-        if not self.dry_run and success > 0:
+        # Step 3: Update exporter state — only when every event is in, otherwise
+        # the exporter would skip its own full scan and never fetch the gaps
+        if not self.dry_run and success > 0 and not failed and not interrupted:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
             now = datetime.now().isoformat()

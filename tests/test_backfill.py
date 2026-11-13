@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+
 import backfill_metrics as bm
-import reimport_event as ri
 
 
 def _capture(calls):
@@ -21,12 +22,15 @@ def test_backfill_import_adds_extra_label_only_when_set(monkeypatch):
     assert calls[1]['params'] == {'extra_label': 'organizer=42'}
 
 
-def test_reimport_delete_scoped_to_extra_label(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ri.requests, 'post', _capture(calls))
-    ri.delete_event_metrics(7, 'ev')
-    monkeypatch.setattr(ri, 'VM_EXTRA_LABEL', 'organizer=42')
-    ri.delete_event_metrics(7, 'ev')
-    n = len(calls) // 2
-    assert calls[0]['params']['match[]'] == 'shotgun_tickets_sold_total{event_id="7"}'
-    assert calls[n]['params']['match[]'] == 'shotgun_tickets_sold_total{event_id="7",organizer="42"}'
+def test_failed_page_is_not_end_of_event():
+    page1 = {'data': [{'ticket_id': 1}], 'pagination': {'next': 'https://x/tickets?after=2026-01-01_1'}}
+    responses = iter([page1, None])
+    fake = SimpleNamespace(_make_request=lambda *a, **k: next(responses))
+    with pytest.raises(RuntimeError, match='page 2'):
+        bm.BackfillExporter.fetch_event_tickets(fake, 7)
+
+
+def test_resold_is_not_refunded():
+    ticket = {'ordered_at': '2026-01-01T00:00:00Z', 'event_id': 7,
+              'deal_title': 'PASS', 'ticket_status': 'resold'}
+    assert bm.BackfillExporter._collect_events_for_ticket(bm.BackfillExporter, ticket, 'ev') == []

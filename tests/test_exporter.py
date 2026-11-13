@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 import requests
@@ -75,6 +76,9 @@ def test_truncated_full_scan_raises_and_keeps_cursor(exporter, monkeypatch):
     with pytest.raises(se.ScanIncomplete) as exc:
         exporter.fetch_all_tickets(full_scan=True)
     assert len(exc.value.tickets) == 1
+
+    _fake_get(monkeypatch, exporter, [page1, _resp(429)])
+    assert exporter._run_scan(full_scan=True) is False
     # an incomplete FULL scan must not rewind the incremental cursor
     assert exporter._get_last_ticket_after() is None
 
@@ -84,8 +88,7 @@ def test_truncated_incremental_scan_saves_progress_cursor(exporter, monkeypatch)
                         'pagination': {'next': TICKETS_PAGE_1}})
     _fake_get(monkeypatch, exporter, [page1, _resp(429)])
 
-    with pytest.raises(se.ScanIncomplete):
-        exporter.fetch_all_tickets(full_scan=False)
+    assert exporter._run_scan(full_scan=False) is False
     assert exporter._get_last_ticket_after() == '2026-01-01T00:00:01Z_1'
 
 
@@ -93,9 +96,31 @@ def test_complete_scan_returns_tickets_and_saves_cursor(exporter, monkeypatch):
     page1 = _resp(200, {'data': [_ticket(1), _ticket(2)], 'pagination': {}})
     _fake_get(monkeypatch, exporter, [page1])
 
-    tickets = exporter.fetch_all_tickets(full_scan=True)
-    assert len(tickets) == 2
+    assert exporter._run_scan(full_scan=True) is True
     assert exporter._get_last_ticket_after() == '2026-01-01T00:00:02Z_2'
+
+
+def test_db_failure_does_not_advance_cursor(exporter, monkeypatch):
+    _fake_get(monkeypatch, exporter, [_resp(200, {'data': [_ticket(1)], 'pagination': {}})])
+    monkeypatch.setattr(exporter, '_save_ticket_to_db',
+                        lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError('database is locked')))
+
+    with pytest.raises(sqlite3.OperationalError):
+        exporter._run_scan(full_scan=False)
+    assert exporter._get_last_ticket_after() is None  # tickets refetched next cycle
+
+
+def test_numbered_titles_use_sub_category(exporter):
+    ticket = {**_ticket(1, title='0000071900'), 'deal_sub_category': 'PASS 3 JOURS'}
+    exporter.process_new_tickets([ticket, _ticket(2)])
+    exporter._recompute_counters()
+    assert _sold(LABELS) == 2  # one series, not one per numbered ticket
+
+
+def test_failed_events_fetch_raises_instead_of_empty(exporter, monkeypatch):
+    monkeypatch.setattr(exporter, '_make_request', lambda *a, **k: None)
+    with pytest.raises(RuntimeError):
+        exporter.fetch_events()
 
 
 def test_recompute_drops_cancelled_from_sold(exporter):

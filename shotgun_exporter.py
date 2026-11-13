@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -158,6 +159,15 @@ class ScanIncomplete(Exception):
         super().__init__(f"scan stopped after {pages} page(s), {len(tickets)} ticket(s) fetched")
         self.tickets = tickets
         self.pages = pages
+
+
+def normalize_ticket_title(title: Optional[str], sub_category: Optional[str]) -> str:
+    """Some imported deals are titled with a per-ticket number ('0000071900'):
+    use the sub-category instead, or every ticket becomes its own series.
+    Must match backfill_metrics._normalize_ticket_title."""
+    if title and re.match(r'^\d{3,}', title) and sub_category:
+        return sub_category
+    return title or 'Unknown Ticket'
 
 
 # Flask API for manual triggers
@@ -333,13 +343,15 @@ class ShotgunExporter:
         def base(event_id, **extra) -> Dict[str, str]:
             return {'event_id': str(event_id), 'event_name': self._get_event_name(event_id), **extra}
 
+        # Several (title, sub_category) groups can normalize to the same
+        # label set: their rows are summed, since callers inc() each row.
         cursor.execute('''
-            SELECT event_id, deal_title, COUNT(*), SUM(deal_price)
+            SELECT event_id, deal_title, deal_sub_category, COUNT(*), SUM(deal_price)
             FROM tickets WHERE ticket_status = 'valid'
-            GROUP BY event_id, deal_title
+            GROUP BY event_id, deal_title, deal_sub_category
         ''')
-        for event_id, deal_title, count, revenue_cents in cursor.fetchall():
-            labels = base(event_id, ticket_title=deal_title or 'Unknown Ticket')
+        for event_id, deal_title, sub_category, count, revenue_cents in cursor.fetchall():
+            labels = base(event_id, ticket_title=normalize_ticket_title(deal_title, sub_category))
             rows.append((tickets_sold_total, labels, count))
             rows.append((tickets_revenue_total, labels, (revenue_cents or 0) / 100.0))
 
@@ -351,14 +363,16 @@ class ShotgunExporter:
         for event_id, channel, count in cursor.fetchall():
             rows.append((tickets_by_channel_total, base(event_id, channel=channel or 'unknown'), count))
 
+        # 'resold' is not a refund: the resale creates a new valid ticket
         cursor.execute('''
-            SELECT event_id, deal_title, COUNT(*)
+            SELECT event_id, deal_title, deal_sub_category, COUNT(*)
             FROM tickets WHERE ticket_status IN ('refunded', 'canceled')
-            GROUP BY event_id, deal_title
+            GROUP BY event_id, deal_title, deal_sub_category
         ''')
-        for event_id, deal_title, count in cursor.fetchall():
+        for event_id, deal_title, sub_category, count in cursor.fetchall():
             rows.append((tickets_refunded_total,
-                         base(event_id, ticket_title=deal_title or 'Unknown Ticket'), count))
+                         base(event_id, ticket_title=normalize_ticket_title(deal_title, sub_category)),
+                         count))
 
         cursor.execute('''
             SELECT event_id, COUNT(*)
@@ -649,7 +663,6 @@ class ShotgunExporter:
             logger.info(f"Fetching tickets ({scan_mode})...")
 
         page_count = 0
-        last_after_value = None
         failed = False
 
         while True:
@@ -671,13 +684,6 @@ class ShotgunExporter:
                 page_count += 1
 
                 logger.info(f"Page {page_count}: {len(tickets)} tickets fetched (total: {len(all_tickets)})")
-
-                # Track the last ticket for next incremental scan
-                last_ticket = tickets[-1]
-                ticket_updated_at = last_ticket.get('ticket_updated_at', '')
-                ticket_id = last_ticket.get('ticket_id', '')
-                if ticket_updated_at and ticket_id:
-                    last_after_value = f"{ticket_updated_at}_{ticket_id}"
 
                 # Check for next page
                 pagination_info = data.get('pagination', {})
@@ -701,13 +707,6 @@ class ShotgunExporter:
                 failed = True
                 break
 
-        # Advance the incremental cursor. An incomplete FULL scan must NOT
-        # save it: that would rewind the cursor months back and lock the
-        # next cycles into re-fetching (and re-429ing) the whole history.
-        if last_after_value and (not failed or not full_scan):
-            self._save_last_ticket_after(last_after_value)
-            logger.debug(f"Saved last_ticket_after: {last_after_value[:50]}...")
-
         logger.info(f"Total: {len(all_tickets)} tickets fetched in {page_count} page(s)")
         if failed:
             raise ScanIncomplete(all_tickets, page_count)
@@ -718,31 +717,19 @@ class ShotgunExporter:
         logger.info("Fetching events...")
 
         future_events_data = self._make_request(EVENTS_URL, use_token=False)
-        future_events = future_events_data.get('data', []) if future_events_data else []
-
         past_events_data = self._make_request(EVENTS_URL, {'past_events': 'true', 'limit': 100}, use_token=False)
-        past_events = past_events_data.get('data', []) if past_events_data else []
+        # a failed call must not look like "no events": that would zero the
+        # event gauges and mark the fetch done for EVENTS_FETCH_INTERVAL
+        if future_events_data is None or past_events_data is None:
+            raise RuntimeError("Events fetch failed, keeping previous event metrics")
 
-        all_events = future_events + past_events
+        all_events = future_events_data.get('data', []) + past_events_data.get('data', [])
         logger.info(f"Total: {len(all_events)} events fetched")
 
         # Update events cache
         self._update_events_cache(all_events)
 
         return all_events
-
-    def _normalize_ticket_title(self, ticket: Dict) -> str:
-        """Normalize ticket title using deal_title or deal_sub_category fallback"""
-        import re
-        ticket_title = ticket.get('deal_title', 'Unknown Ticket')
-
-        # If title starts with 3+ digits, use sub_category as fallback
-        if re.match(r'^\d{3,}', str(ticket_title)):
-            deal_sub_category = ticket.get('deal_sub_category')
-            if deal_sub_category:
-                return deal_sub_category
-
-        return ticket_title if ticket_title else 'Unknown Ticket'
 
     def _filter_personal_data(self, ticket: Dict) -> Dict:
         """Remove personal data fields from ticket before storing.
@@ -894,6 +881,7 @@ class ShotgunExporter:
         except Exception as e:
             logger.error(f"Error processing tickets: {e}", exc_info=True)
             conn.rollback()
+            raise  # caller must not advance the incremental cursor
         finally:
             conn.close()
 
@@ -967,7 +955,8 @@ class ShotgunExporter:
                             monitor_slug=monitor_slug,
                             status=sentry_sdk.crons.MonitorStatus.ERROR,
                         )
-                    raise
+                    # not marked fetched → retried next cycle; tickets scan still runs
+                    logger.error(f"Events fetch failed: {e}")
             else:
                 logger.info(f"Skipping events fetch (next fetch in {EVENTS_FETCH_INTERVAL/3600:.1f} hours)")
 
@@ -1020,18 +1009,27 @@ class ShotgunExporter:
         mode = 'full' if full_scan else 'incremental'
         try:
             tickets = self.fetch_all_tickets(full_scan=full_scan)
+            incomplete = None
         except ScanIncomplete as e:
-            self.process_new_tickets(e.tickets)
-            self._recompute_counters()
+            tickets, incomplete = e.tickets, e
+
+        self.process_new_tickets(tickets)  # raises on DB error: cursor stays put
+        # Advance the incremental cursor only once the tickets are stored. An
+        # incomplete FULL scan must NOT save it: that would rewind the cursor
+        # months back and make the next cycles re-fetch the whole history.
+        last = tickets[-1] if tickets else {}
+        if last.get('ticket_updated_at') and last.get('ticket_id') and not (incomplete and full_scan):
+            self._save_last_ticket_after(f"{last['ticket_updated_at']}_{last['ticket_id']}")
+        self._recompute_counters()
+
+        if incomplete:
             scans_total.labels(mode=mode, status='incomplete').inc()
             if full_scan:
-                logger.error(f"Full scan INCOMPLETE ({e}) — will retry next cycle")
+                logger.error(f"Full scan INCOMPLETE ({incomplete}) — will retry next cycle")
             else:
-                logger.warning(f"Incremental scan incomplete ({e}) — resumes from saved cursor")
+                logger.warning(f"Incremental scan incomplete ({incomplete}) — resumes from saved cursor")
             return False
 
-        self.process_new_tickets(tickets)
-        self._recompute_counters()
         scans_total.labels(mode=mode, status='complete').inc()
         if full_scan:
             self._mark_full_scan_done()
