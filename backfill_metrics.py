@@ -606,6 +606,16 @@ class BackfillExporter:
         self._mark_event_progress(event_id, 'done', len(tickets), sent)
         return True
 
+    def _db_only_events(self, listed: set) -> List[Tuple[int, str]]:
+        """Events the exporter's full scan stored (e.g. co-hosted events owned by
+        an external organizer) but the organizer's events API does not list."""
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            ids = [r[0] for r in conn.execute('SELECT DISTINCT event_id FROM tickets')]
+        finally:
+            conn.close()
+        return [(eid, self._get_event_name(eid)) for eid in ids if eid is not None and eid not in listed]
+
     def run(self):
         """Main backfill process: event by event with resume support."""
         print("=" * 80)
@@ -618,12 +628,11 @@ class BackfillExporter:
             print("[RESUME MODE - skipping already completed events]")
 
         # Step 1: Fetch events
-        all_events = self.fetch_events()
-        if not all_events:
+        event_list = [(e['id'], e.get('name', 'Unknown')) for e in self.fetch_events() if e.get('id')]
+        event_list += self._db_only_events({eid for eid, _ in event_list})
+        if not event_list:
             print("No events found")
             return
-
-        event_list = [(e['id'], e.get('name', 'Unknown')) for e in all_events if e.get('id')]
         print(f"\n{len(event_list)} events to process")
 
         # Filter already completed events in resume mode

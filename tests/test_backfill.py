@@ -1,3 +1,4 @@
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,18 @@ def test_failed_page_is_not_end_of_event():
     fake = SimpleNamespace(_make_request=lambda *a, **k: next(responses))
     with pytest.raises(RuntimeError, match='page 2'):
         bm.BackfillExporter.fetch_event_tickets(fake, 7)
+
+
+def test_db_only_events_adds_cohosted_events_missing_from_events_api(tmp_path, monkeypatch):
+    db = tmp_path / 't.db'
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE tickets (ticket_id INTEGER, event_id INTEGER)')
+    conn.executemany('INSERT INTO tickets VALUES (?, ?)', [(1, 10), (2, 10), (3, 99)])
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(bm, 'DB_FILE', db)
+    fake = SimpleNamespace(_get_event_name=lambda eid: 'Unknown Event')
+    assert bm.BackfillExporter._db_only_events(fake, {10}) == [(99, 'Unknown Event')]
 
 
 def test_resold_is_not_refunded():
